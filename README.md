@@ -2,11 +2,12 @@
 
 This repository contains the source for the EPA Orchestrator snap.
 
-**EPA Orchestrator** is designed to provide secure, policy-driven resource orchestration for snaps and workloads on Linux systems. Its vision is to enable fine-grained, dynamic allocation and management of system resources—starting with CPU pinning, but with plans to expand to other resource types and orchestration policies. The orchestrator exposes a secure Unix socket API for resource allocation and introspection, making it easy for other snaps (such as openstack-hypervisor) and workloads to request and manage dedicated or shared resources in a controlled manner.
+**EPA Orchestrator** is designed to provide secure, policy-driven resource orchestration for snaps and workloads on Linux systems. Its vision is to enable fine-grained, dynamic allocation and management of system resources—starting with CPU pinning and memory management, with plans to expand to other resource types and orchestration policies. The orchestrator exposes a secure Unix socket API for resource allocation and introspection, making it easy for other snaps (such as openstack-hypervisor) and workloads to request and manage dedicated or shared resources in a controlled manner.
 
 ## Features
 
 - **CPU Pinning and Allocation**: Allocate isolated and shared CPU sets to snaps and workloads, supporting both dedicated and shared CPU usage models with basic system-size heuristics.
+- **Memory Management and Hugepage Tracking**: Introspect NUMA hugepages and track hugepage allocations across NUMA nodes with per-service allocation tracking.
 - **Resource Introspection**: Query current allocations and available resources via a secure API.
 - **Secure Unix Socket API**: All orchestration actions are performed via a secure, local Unix socket with JSON-based requests and responses.
 - **Basic Allocation Heuristics**: Automatic allocation based on system size (small vs large systems) when no specific core count is requested.
@@ -26,7 +27,7 @@ This policy ensures that on large servers, a fixed number of CPUs are always ava
 
 ### Planned Features
 
-- **Memory Pinning and Allocation**: Enable allocation and isolation of memory resources for snaps and workloads.
+- **Hugepage Introspection and Tracking**: ✅ **Implemented** - NUMA hugepage introspection and tracking via `get_memory_info` and `allocate_hugepages` actions.
 
 ## Getting Started
 
@@ -36,7 +37,7 @@ To get started with the EPA Orchestrator, install the snap using snapd:
 sudo snap install epa-orchestrator --dangerous --devmode
 ```
 
-The snap runs a daemon that listens on a Unix domain socket and provides a JSON API for CPU allocation and introspection.
+The snap runs a daemon that listens on a Unix domain socket and provides a JSON API for CPU allocation and hugepage introspection/tracking.
 
 ## Configuration Reference
 
@@ -137,6 +138,97 @@ Get all current service allocations:
   "total_available_cpus": 0,
   "remaining_available_cpus": 0,
   "allocations": []
+}
+```
+
+#### 3. Get Memory Info (`get_memory_info`)
+
+Get NUMA hugepage information (with EPA-tracked overlay), keyed by node name with usage lists:
+
+```json
+{
+  "version": "1.0",
+  "service_name": "my-service",
+  "action": "get_memory_info"
+}
+```
+
+#### Response Example (Success)
+
+```json
+{
+  "version": "1.0",
+  "service_name": "my-service",
+  "numa_hugepages": {
+    "node0": {
+      "usage": [
+        { "total": 100, "free": 60, "size": 2048 },
+        { "total": 4, "free": 1, "size": 1048576 }
+      ],
+      "allocations": {
+        "openstack-hypervisor": { "2048": 20, "1048576": 2 },
+        "database-service": { "2048": 15, "1048576": 1 },
+        "my-service": { "2048": 5 }
+      }
+    }
+  }
+}
+```
+
+#### Response Example (No Hugepages)
+
+```json
+{
+  "version": "1.0",
+  "service_name": "my-service",
+  "numa_hugepages": {}
+}
+```
+
+#### 4. Allocate Hugepages (`allocate_hugepages`)
+
+Record hugepage allocation request (tracking-only) for a specific NUMA node and size:
+
+```json
+{
+  "version": "1.0",
+  "service_name": "my-service",
+  "action": "allocate_hugepages",
+  "hugepages_requested": 2,
+  "node_id": 0,
+  "size_kb": 2048
+}
+```
+
+- `hugepages_requested`: Number of hugepages to record
+- `node_id`: NUMA node ID for per-node tracking
+- `size_kb`: Hugepage size in KB (e.g., 2048 for 2MB, 1048576 for 1GB)
+
+#### Response Example (Success)
+
+```json
+{
+  "version": "1.0",
+  "service_name": "my-service",
+  "hugepages_requested": 2,
+  "allocation_successful": true,
+  "message": "Successfully recorded allocation request for 2 hugepages",
+  "node_id": 0,
+  "size_kb": 2048
+}
+```
+
+#### Response Example (Error)
+
+```json
+{
+  "version": "1.0",
+  "service_name": "my-service",
+  "hugepages_requested": 2,
+  "allocation_successful": false,
+  "message": "Failed to record hugepage allocation: internal error",
+  "node_id": 0,
+  "size_kb": 2048
 }
 ```
 

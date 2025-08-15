@@ -5,19 +5,26 @@
 
 import json
 import logging
-from typing import Union
+from typing import Dict, Union, cast
 
 from pydantic import TypeAdapter, ValidationError
 
 from epa_orchestrator.allocations_db import allocations_db
 from epa_orchestrator.cpu_pinning import calculate_cpu_pinning, get_isolated_cpus
+from epa_orchestrator.hugepages_db import record_allocation
+from epa_orchestrator.memory_manager import get_memory_summary
 from epa_orchestrator.schemas import (
     AllocateCoresRequest,
     AllocateCoresResponse,
+    AllocateHugepagesRequest,
+    AllocateHugepagesResponse,
     EpaRequest,
     ErrorResponse,
+    GetMemoryInfoRequest,
     ListAllocationsRequest,
     ListAllocationsResponse,
+    MemoryInfoResponse,
+    NodeHugepagesInfo,
     SnapAllocation,
 )
 from epa_orchestrator.utils import _count_cpus_in_ranges
@@ -128,6 +135,54 @@ def handle_list_allocations(request: ListAllocationsRequest) -> ListAllocationsR
     )
 
 
+def handle_get_memory_info(request: GetMemoryInfoRequest) -> MemoryInfoResponse:
+    """Handle get memory info action."""
+    try:
+        memory_summary = get_memory_summary()
+        numa_map = cast(Dict[str, NodeHugepagesInfo], memory_summary.get("numa_hugepages", {}))
+        return MemoryInfoResponse(
+            service_name=request.service_name,
+            numa_hugepages=numa_map,
+        )
+    except Exception as e:
+        logging.error(f"Failed to get memory information: {e}")
+        return MemoryInfoResponse(
+            service_name=request.service_name,
+            numa_hugepages={},
+        )
+
+
+def handle_allocate_hugepages(request: AllocateHugepagesRequest) -> AllocateHugepagesResponse:
+    """Handle allocate hugepages action (tracking only)."""
+    try:
+        record_allocation(
+            request.service_name, request.node_id, request.size_kb, request.hugepages_requested
+        )
+
+        message = (
+            f"Successfully recorded allocation request for {request.hugepages_requested} hugepages"
+        )
+
+        return AllocateHugepagesResponse(
+            service_name=request.service_name,
+            hugepages_requested=request.hugepages_requested,
+            allocation_successful=True,
+            message=message,
+            node_id=request.node_id,
+            size_kb=request.size_kb,
+        )
+    except Exception as e:
+        logging.error(f"Failed to record hugepage allocation: {e}")
+        return AllocateHugepagesResponse(
+            service_name=request.service_name,
+            hugepages_requested=request.hugepages_requested,
+            allocation_successful=False,
+            message=f"Failed to record hugepage allocation: {e}",
+            node_id=request.node_id,
+            size_kb=request.size_kb,
+        )
+
+
 def handle_daemon_request(data: bytes) -> bytes:
     """Handle daemon request.
 
@@ -139,14 +194,27 @@ def handle_daemon_request(data: bytes) -> bytes:
     """
     try:
         request_data = json.loads(data.decode())
-        request: Union[AllocateCoresRequest, ListAllocationsRequest] = TypeAdapter(
-            EpaRequest
-        ).validate_python(request_data)
-        response: Union[AllocateCoresResponse, ListAllocationsResponse, ErrorResponse]
+        request: Union[
+            AllocateCoresRequest,
+            ListAllocationsRequest,
+            GetMemoryInfoRequest,
+            AllocateHugepagesRequest,
+        ] = TypeAdapter(EpaRequest).validate_python(request_data)
+        response: Union[
+            AllocateCoresResponse,
+            ListAllocationsResponse,
+            MemoryInfoResponse,
+            AllocateHugepagesResponse,
+            ErrorResponse,
+        ]
         if isinstance(request, AllocateCoresRequest):
             response = handle_allocate_cores(request)
         elif isinstance(request, ListAllocationsRequest):
             response = handle_list_allocations(request)
+        elif isinstance(request, GetMemoryInfoRequest):
+            response = handle_get_memory_info(request)
+        elif isinstance(request, AllocateHugepagesRequest):
+            response = handle_allocate_hugepages(request)
         else:
             response = ErrorResponse(
                 error=f"Unknown action: {getattr(request, 'action', None)}",

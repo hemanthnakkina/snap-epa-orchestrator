@@ -92,8 +92,8 @@ exclude = [
     ".venv/lib/python*/site-packages"
 ]
 select = ["E", "W", "F", "C", "N", "R", "D", "H"]
-# Ignore W503, E501 because using black creates errors with this
-ignore = ["W503", "E501"]
+# Ignore W503, E501, E203 because using black creates errors with this
+ignore = ["W503", "E501", "E203"]
 docstring-convention = "google"
 # Check for properly formatted copyright header in each file
 copyright-check = "True"
