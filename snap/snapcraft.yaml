@@ -16,6 +16,7 @@ apps:
     daemon: simple
     plugs:
       - network-bind
+      - sys-devices-system-node
     slots:
       - epa-info
 
@@ -40,3 +41,9 @@ slots:
     source:
       write:
         - $SNAP_DATA/data
+
+plugs:
+  sys-devices-system-node:
+    interface: system-files
+    read:
+      - /sys/devices/system/node

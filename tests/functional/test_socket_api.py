@@ -1,7 +1,10 @@
-# SPDX-FileCopyrightText: 2024 Canonical Ltd.
+# SPDX-FileCopyrightText: 2024 - Canonical Ltd
 # SPDX-License-Identifier: Apache-2.0
 
-"""Functional tests for EPA Orchestrator socket API: testing with real daemon."""
+"""Functional tests for EPA Orchestrator socket API: testing with real daemon.
+
+This suite exercises live socket interactions.
+"""
 
 import json
 import socket
@@ -16,7 +19,7 @@ def test_allocate_cores_via_socket_api(socket_path):
         "version": "1.0",
         "service_name": "test-service",
         "action": "allocate_cores",
-        "cores_requested": 2,
+        "num_of_cores": 2,
     }
 
     sock.sendall(json.dumps(request).encode())
@@ -29,7 +32,7 @@ def test_allocate_cores_via_socket_api(socket_path):
     else:
         assert result["version"] == "1.0"
         assert result["service_name"] == "test-service"
-        assert result["cores_requested"] == 2
+        assert result["num_of_cores"] == 2
 
         # Check for successful allocation (no error)
         assert not result.get("error"), f"Unexpected error in response: {result.get('error')}"
@@ -70,5 +73,9 @@ def test_list_allocations_via_socket_api(socket_path):
     assert result["remaining_available_cpus"] >= 0
     assert "allocations" in result
     assert isinstance(result["allocations"], list)
+
+    for allocation in result["allocations"]:
+        assert "is_explicit" in allocation
+        assert isinstance(allocation["is_explicit"], bool)
 
     sock.close()

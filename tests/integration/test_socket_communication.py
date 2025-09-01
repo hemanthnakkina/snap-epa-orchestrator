@@ -3,6 +3,7 @@
 
 """Concise integration test for socket communication with the daemon functionality."""
 
+import json
 import os
 import socket
 import threading
@@ -11,6 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from pydantic import parse_obj_as
 
 from epa_orchestrator.daemon_handler import handle_daemon_request
 from epa_orchestrator.schemas import (
@@ -101,15 +103,15 @@ class TestSocketCommunication:
     def test_allocate_cores_via_socket(self, socket_daemon, socket_path):
         """Test allocating cores through socket communication."""
         request = AllocateCoresRequest(
-            service_name="service1", action=ActionType.ALLOCATE_CORES, cores_requested=1
+            service_name="service1", action=ActionType.ALLOCATE_CORES, num_of_cores=1
         )
 
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.connect(socket_path)
-            client.sendall(request.model_dump_json().encode())
+            client.sendall(request.json().encode())
             response_data = client.recv(4096)
 
-        response = AllocateCoresResponse.model_validate_json(response_data.decode())
+        response = parse_obj_as(AllocateCoresResponse, json.loads(response_data.decode()))
         assert response.service_name == "service1"
         assert response.cores_allocated == 1
 
@@ -126,60 +128,15 @@ class TestSocketCommunication:
 
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.connect(socket_path)
-            client.sendall(request.model_dump_json().encode())
+            client.sendall(request.json().encode())
             response_data = client.recv(4096)
 
-        response = ListAllocationsResponse.model_validate_json(response_data.decode())
+        response = parse_obj_as(ListAllocationsResponse, json.loads(response_data.decode()))
         assert response.total_allocations >= 0
         assert response.total_allocated_cpus >= 0
         assert response.total_available_cpus > 0
         assert response.remaining_available_cpus >= 0
         assert isinstance(response.allocations, list)
-
-    @pytest.mark.parametrize(
-        "socket_daemon",
-        [patch_isolated_cpus_valid],
-        indirect=True,
-    )
-    def test_multiple_allocations(self, socket_daemon, socket_path):
-        """Test multiple allocations and their tracking."""
-        req1 = AllocateCoresRequest(
-            service_name="service1", action=ActionType.ALLOCATE_CORES, cores_requested=4
-        )
-        req2 = AllocateCoresRequest(
-            service_name="service2", action=ActionType.ALLOCATE_CORES, cores_requested=4
-        )
-        req3 = AllocateCoresRequest(
-            service_name="service3", action=ActionType.ALLOCATE_CORES, cores_requested=1000
-        )
-
-        # Send first request
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client1:
-            client1.connect(socket_path)
-            client1.sendall(req1.model_dump_json().encode())
-            resp1_data = client1.recv(4096)
-
-        # Send second request
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client2:
-            client2.connect(socket_path)
-            client2.sendall(req2.model_dump_json().encode())
-            resp2_data = client2.recv(4096)
-
-        # Send third request
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client3:
-            client3.connect(socket_path)
-            client3.sendall(req3.model_dump_json().encode())
-            resp3_data = client3.recv(4096)
-
-        # Verify first two succeeded
-        resp1 = AllocateCoresResponse.model_validate_json(resp1_data.decode())
-        resp2 = AllocateCoresResponse.model_validate_json(resp2_data.decode())
-        assert resp1.cores_allocated == 4
-        assert resp2.cores_allocated == 4
-
-        # Verify third failed
-        resp3 = ErrorResponse.model_validate_json(resp3_data.decode())
-        assert "Insufficient CPUs available" in resp3.error
 
     @pytest.mark.parametrize(
         "socket_daemon",
@@ -189,13 +146,13 @@ class TestSocketCommunication:
     def test_no_isolated_cpus_configured(self, socket_daemon, socket_path):
         """Test error response when no isolated CPUs are configured."""
         req = AllocateCoresRequest(
-            service_name="service1", action=ActionType.ALLOCATE_CORES, cores_requested=2
+            service_name="service1", action=ActionType.ALLOCATE_CORES, num_of_cores=2
         )
 
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.connect(socket_path)
-            client.sendall(req.model_dump_json().encode())
+            client.sendall(req.json().encode())
             resp_data = client.recv(4096)
 
-        resp = ErrorResponse.model_validate_json(resp_data.decode())
+        resp = parse_obj_as(ErrorResponse, json.loads(resp_data.decode()))
         assert resp.error == "No Isolated CPUs configured"

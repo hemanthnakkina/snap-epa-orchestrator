@@ -20,11 +20,11 @@ class TestSchemas:
     def test_allocate_cores_request_valid(self):
         """Test valid AllocateCoresRequest creation."""
         req = AllocateCoresRequest(
-            service_name="service1", action=ActionType.ALLOCATE_CORES, cores_requested=2
+            service_name="service1", action=ActionType.ALLOCATE_CORES, num_of_cores=2
         )
         assert req.service_name == "service1"
         assert req.action == ActionType.ALLOCATE_CORES
-        assert req.cores_requested == 2
+        assert req.num_of_cores == 2
 
     def test_list_allocations_request_valid(self):
         """Test valid ListAllocationsRequest creation."""
@@ -35,9 +35,7 @@ class TestSchemas:
     def test_allocate_cores_request_invalid(self):
         """Test invalid AllocateCoresRequest creation."""
         with pytest.raises(Exception):
-            AllocateCoresRequest(
-                service_name="service1", action="invalid_action", cores_requested=2
-            )
+            AllocateCoresRequest(service_name="service1", action="invalid_action", num_of_cores=2)
 
     def test_list_allocations_request_invalid(self):
         """Test invalid ListAllocationsRequest creation."""
@@ -48,7 +46,7 @@ class TestSchemas:
         """Test AllocateCoresResponse serialization."""
         resp = AllocateCoresResponse(
             service_name="service1",
-            cores_requested=2,
+            num_of_cores=2,
             cores_allocated=2,
             allocated_cores="0-1",
             shared_cpus="2-3",

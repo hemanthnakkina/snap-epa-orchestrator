@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2024 Canonical Ltd.
+# SPDX-FileCopyrightText: 2024 - Canonical Ltd
 # SPDX-License-Identifier: Apache-2.0
 
 """Concise unit tests for epa_orchestrator.allocations_db."""

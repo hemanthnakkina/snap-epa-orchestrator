@@ -8,6 +8,7 @@ import socket
 import threading
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from pydantic import parse_obj_as
@@ -80,8 +81,15 @@ class TestMemoryIntegration:
         assert response.service_name == "test-service"
         assert isinstance(response.numa_hugepages, dict)
 
-    def test_allocate_hugepages_via_socket(self, memory_socket_daemon, socket_path):
+    @patch("epa_orchestrator.daemon_handler.get_memory_summary")
+    def test_allocate_hugepages_via_socket(self, mock_summary, memory_socket_daemon, socket_path):
         """Test hugepage allocation through socket communication."""
+        # Provide capacity so the allocation passes under capacity checks
+        mock_summary.return_value = {
+            "numa_hugepages": {
+                "node0": {"capacity": [{"total": 10, "free": 10, "size": 2048}], "allocations": {}}
+            }
+        }
         request = AllocateHugepagesRequest(
             service_name="test-service",
             action=ActionType.ALLOCATE_HUGEPAGES,

@@ -8,13 +8,14 @@ This repository contains the source for the EPA Orchestrator snap.
 
 - **CPU Pinning and Allocation**: Allocate isolated and shared CPU sets to snaps and workloads, supporting both dedicated and shared CPU usage models with basic system-size heuristics.
 - **Memory Management and Hugepage Tracking**: Introspect NUMA hugepages and track hugepage allocations across NUMA nodes with per-service allocation tracking.
+- **NUMA-Aware Core Allocation**: Request a specific number of cores from a particular NUMA node with override/append semantics and exact-count guarantees.
 - **Resource Introspection**: Query current allocations and available resources via a secure API.
 - **Secure Unix Socket API**: All orchestration actions are performed via a secure, local Unix socket with JSON-based requests and responses.
 - **Basic Allocation Heuristics**: Automatic allocation based on system size (small vs large systems) when no specific core count is requested.
 
 ### CPU Allocation Policy: Small vs. Large Systems
 
-When a client requests core allocation with `cores_requested: 0`, EPA Orchestrator applies a policy based on the total number of CPUs detected:
+When a client requests core allocation with `num_of_cores: 0`, EPA Orchestrator applies a policy based on the total number of CPUs detected:
 
 - **Small systems (≤100 CPUs):**
   - By default, 80% of the available CPUs are allocated to the requesting snap or workload.
@@ -24,6 +25,17 @@ When a client requests core allocation with `cores_requested: 0`, EPA Orchestrat
   - All other CPUs are allocated to the requesting snap or workload.
 
 This policy ensures that on large servers, a fixed number of CPUs are always available for system or shared use, while on smaller systems, a proportional allocation is used.
+
+### NUMA-Aware Core Allocation Policy
+
+The NUMA-aware allocation action allows services to request a specific number of cores from a particular NUMA node:
+
+- **NUMA Locality**: Cores are allocated from the specified NUMA node to ensure optimal memory access patterns.
+- **Force Reallocation**: NUMA allocation will override any existing non-explicit allocations to other services, even if they span multiple NUMA nodes.
+- **Atomic Exact-Count**: If fewer than the requested number of cores are available in the NUMA node, the request fails with an error; no partial allocation occurs.
+- **Priority System**: NUMA allocations take precedence over automatic allocations and cannot be overridden by other services.
+- **Per-NUMA override/append semantics**: If the same service requests the same NUMA node again, it overrides previous cores from that node. If it requests a different NUMA node, the new cores are appended so the service may hold allocations across multiple NUMA nodes.
+- **Per-NUMA deallocation**: Sending `num_of_cores = -1` for a node deallocates any existing cores for that service in that node. `num_of_cores = 0` is invalid for NUMA.
 
 ### Planned Features
 
@@ -37,7 +49,7 @@ To get started with the EPA Orchestrator, install the snap using snapd:
 sudo snap install epa-orchestrator --dangerous --devmode
 ```
 
-The snap runs a daemon that listens on a Unix domain socket and provides a JSON API for CPU allocation and hugepage introspection/tracking.
+The snap runs a daemon that listens on a Unix domain socket and provides a JSON API for CPU allocation and introspection.
 
 ## Configuration Reference
 
@@ -62,11 +74,12 @@ Request CPU allocation for a specific service:
   "version": "1.0",
   "service_name": "my-service",
   "action": "allocate_cores",
-  "cores_requested": 2
+  "num_of_cores": 2
 }
 ```
 
-- `cores_requested`: Number of cores to allocate (0 = 80% of total CPUs)
+- `num_of_cores`: Number of cores to allocate. `0` (80% of total CPUs).
+- `numa_node` is not allowed for this action and will be rejected.
 
 #### Response Example (Success)
 
@@ -74,7 +87,7 @@ Request CPU allocation for a specific service:
 {
   "version": "1.0",
   "service_name": "my-service",
-  "cores_requested": 2,
+  "num_of_cores": 2,
   "cores_allocated": 2,
   "allocated_cores": "0-1",
   "shared_cpus": "2-19",
@@ -92,7 +105,64 @@ Request CPU allocation for a specific service:
 }
 ```
 
-#### 2. List Allocations (`list_allocations`)
+#### 2. Allocate NUMA Cores (`allocate_numa_cores`)
+
+Request a specific number of cores from a particular NUMA node:
+
+```json
+{
+  "version": "1.0",
+  "service_name": "my-service",
+  "action": "allocate_numa_cores",
+  "numa_node": 1,
+  "num_of_cores": 5
+}
+```
+
+- `numa_node`: NUMA node ID to allocate cores from (0-based)
+- `num_of_cores`: Number of cores to allocate from the specified NUMA node
+  - `> 0` allocates exactly that many cores
+  - `-1` deallocates any existing cores for that service in that node
+  - `0` is invalid
+
+#### Response Example (Success)
+
+```json
+{
+  "version": "1.0",
+  "service_name": "my-service",
+  "numa_node": 1,
+  "num_of_cores": 5,
+  "cores_allocated": "4-8",
+  "total_available_cpus": 20,
+  "remaining_available_cpus": 15
+}
+```
+
+#### Response Example (Insufficient Cores Error)
+
+```json
+{
+  "version": "1.0",
+  "error": "NUMA node 1 only has 3 isolated CPUs, but 5 were requested"
+}
+```
+
+#### Response Example (Per-NUMA Deallocation)
+
+```json
+{
+  "version": "1.0",
+  "service_name": "my-service",
+  "numa_node": 1,
+  "num_of_cores": -1,
+  "cores_allocated": "",
+  "total_available_cpus": 20,
+  "remaining_available_cpus": 20
+}
+```
+
+#### 3. List Allocations (`list_allocations`)
 
 Get all current service allocations:
 
@@ -117,12 +187,14 @@ Get all current service allocations:
     {
       "service_name": "my-service",
       "allocated_cores": "0-1",
-      "cores_count": 2
+      "cores_count": 2,
+      "is_explicit": false
     },
     {
       "service_name": "another-service",
       "allocated_cores": "2-3",
-      "cores_count": 2
+      "cores_count": 2,
+      "is_explicit": true
     }
   ]
 }
@@ -200,7 +272,7 @@ Record hugepage allocation request (tracking-only) for a specific NUMA node and 
 }
 ```
 
-- `hugepages_requested`: Number of hugepages to record
+- `hugepages_requested`: Number of hugepages to record (>0), use `-1` to deallocate, `0` is invalid
 - `node_id`: NUMA node ID for per-node tracking
 - `size_kb`: Hugepage size in KB (e.g., 2048 for 2MB, 1048576 for 1GB)
 
@@ -212,19 +284,36 @@ Record hugepage allocation request (tracking-only) for a specific NUMA node and 
   "service_name": "my-service",
   "hugepages_requested": 2,
   "allocation_successful": true,
-  "message": "Successfully recorded allocation request for 2 hugepages",
+  "message": "Successfully set allocation request to 2 hugepages",
   "node_id": 0,
   "size_kb": 2048
 }
 ```
 
-#### Response Example (Error)
+#### Response Example (Deallocate)
 
 ```json
 {
   "version": "1.0",
-  "error": "Failed to record hugepage allocation: internal error"
+  "service_name": "my-service",
+  "hugepages_requested": -1,
+  "allocation_successful": true,
+  "message": "Removed recorded hugepage allocation",
+  "node_id": 0,
+  "size_kb": 2048
 }
+```
+
+#### Response Examples (Errors)
+
+```json
+{ "version": "1.0", "error": "NUMA node 3 not found" }
+```
+```json
+{ "version": "1.0", "error": "Hugepage size 1048576 KB not found on node 0" }
+```
+```json
+{ "version": "1.0", "error": "NUMA node 0 size 2048 KB only has 5 free hugepages, requested 10" }
 ```
 
 ## Build
