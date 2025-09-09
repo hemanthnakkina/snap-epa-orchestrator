@@ -80,7 +80,7 @@ class TestDaemonIntegration:
         """Test error response when no isolated CPUs are configured in daemon handler."""
         with patch(
             "epa_orchestrator.cpu_pinning.get_isolated_cpus",
-            side_effect=RuntimeError("No Isolated CPUs configured"),
+            return_value="",
         ):
             request = {
                 "version": "1.0",
@@ -90,7 +90,21 @@ class TestDaemonIntegration:
             }
             response_bytes = handle_daemon_request(bytes(str(request).replace("'", '"'), "utf-8"))
             resp = parse_obj_as(ErrorResponse, json.loads(response_bytes.decode()))
-            assert resp.error == "No Isolated CPUs configured"
+            assert resp.error == "No CPUs available"
+
+    def test_allocate_numa_cores_no_isolated_cpus(self):
+        """Test error when no isolated CPUs are available for NUMA allocation."""
+        request = {
+            "version": "1.0",
+            "service_name": "service1",
+            "action": "allocate_numa_cores",
+            "numa_node": 0,
+            "num_of_cores": 2,
+        }
+        with patch("epa_orchestrator.cpu_pinning.get_isolated_cpus", return_value=""):
+            response_bytes = handle_daemon_request(json.dumps(request).encode())
+            resp = parse_obj_as(ErrorResponse, json.loads(response_bytes.decode()))
+            assert resp.error == "No Isolated CPUs available for allocation"
 
     @patch("epa_orchestrator.daemon_handler.get_memory_summary")
     def test_allocate_hugepages_track_positive(self, mock_summary):

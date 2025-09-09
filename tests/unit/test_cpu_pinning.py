@@ -5,8 +5,6 @@
 
 from unittest.mock import mock_open, patch
 
-import pytest
-
 from epa_orchestrator.cpu_pinning import calculate_cpu_pinning, get_isolated_cpus
 
 
@@ -97,8 +95,16 @@ class TestCpuPinning:
         mock_logging.info.assert_called()
 
     def test_get_isolated_cpus_no_isolated(self, mock_logging):
-        """Test error when no isolated CPUs are configured."""
+        """Test behavior when no isolated CPUs are configured."""
         m = mock_open(read_data="")
         with patch("builtins.open", m):
-            with pytest.raises(RuntimeError, match="No Isolated CPUs configured"):
-                get_isolated_cpus()
+            result = get_isolated_cpus()
+            assert result == ""
+            # No logging should happen for empty file
+
+    def test_get_isolated_cpus_file_not_found(self, mock_logging):
+        """Test behavior when isolated CPUs file doesn't exist."""
+        with patch("builtins.open", side_effect=FileNotFoundError("File not found")):
+            result = get_isolated_cpus()
+            assert result == ""
+            mock_logging.error.assert_called_with("Failed to get CPU information: File not found")

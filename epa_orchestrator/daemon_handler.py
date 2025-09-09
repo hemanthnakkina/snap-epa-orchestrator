@@ -41,10 +41,7 @@ def handle_allocate_cores(request: AllocateCoresRequest) -> AllocateCoresRespons
     if request.numa_node is not None:
         raise ValueError("'numa_node' is not allowed for action allocate_cores")
 
-    try:
-        isolated = get_isolated_cpus()
-    except RuntimeError as e:
-        raise ValueError("No Isolated CPUs configured") from e
+    isolated = get_isolated_cpus()
     if not isolated:
         raise ValueError("No CPUs available")
 
@@ -118,6 +115,9 @@ def handle_allocate_numa_cores(
             total_available_cpus=stats["total_available_cpus"],
             remaining_available_cpus=updated_stats["remaining_available_cpus"],
         )
+
+    if not isolated:
+        raise ValueError("No Isolated CPUs available for allocation")
 
     # Allocation path (num_of_cores > 0)
     available_numa_cpus = get_cpus_in_numa_node(request.numa_node, isolated)
@@ -258,17 +258,7 @@ def handle_list_allocations(request: ListAllocationsRequest) -> ListAllocationsR
     Returns:
         ListAllocationsResponse with detailed allocation information
     """
-    try:
-        isolated = get_isolated_cpus()
-    except RuntimeError:
-        # Return empty response when no isolated CPUs are configured
-        return ListAllocationsResponse(
-            total_allocations=0,
-            total_allocated_cpus=0,
-            total_available_cpus=0,
-            remaining_available_cpus=0,
-            allocations=[],
-        )
+    isolated = get_isolated_cpus()
     if not isolated:
         # Return empty response when no isolated CPUs are available
         return ListAllocationsResponse(

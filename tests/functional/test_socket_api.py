@@ -28,7 +28,7 @@ def test_allocate_cores_via_socket_api(socket_path):
 
     if "error" in result:
         # Acceptable if no isolated CPUs are configured
-        assert "No Isolated CPUs configured" in result["error"]
+        assert "No CPUs available" in result["error"]
     else:
         assert result["version"] == "1.0"
         assert result["service_name"] == "test-service"

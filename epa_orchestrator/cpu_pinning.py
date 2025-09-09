@@ -19,9 +19,6 @@ def get_isolated_cpus() -> str:
 
     Returns:
         str: Comma-separated list of CPU ranges that are isolated
-
-    Raises:
-        RuntimeError: If no isolated CPUs are configured
     """
     try:
         with open(ISOLATED_CPUS_PATH, "r") as f:
@@ -29,11 +26,10 @@ def get_isolated_cpus() -> str:
             if value:
                 logging.info(f"Found isolated CPUs: {value}")
                 return value
-        logging.error("No Isolated CPUs configured")
-        raise RuntimeError("No Isolated CPUs configured")
+        logging.info("No Isolated CPUs configured")
     except Exception as e:
         logging.error(f"Failed to get CPU information: {e}")
-        raise RuntimeError("No Isolated CPUs configured") from e
+    return ""
 
 
 def calculate_cpu_pinning(cpu_list: str, cores_requested: int = 0) -> "tuple[str, str]":
