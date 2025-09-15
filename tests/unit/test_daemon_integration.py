@@ -250,7 +250,10 @@ class TestDaemonIntegration:
         }
         resp_b = handle_daemon_request(json.dumps(req).encode())
         resp = parse_obj_as(ErrorResponse, json.loads(resp_b.decode()))
-        assert resp.error == "NUMA node 0 size 2048 KB only has 1 free hugepages, requested 3"
+        assert (
+            resp.error
+            == "NUMA node 0 size 2048 KB only has 1 free hugepages, requested additional 3"
+        )
 
     @patch("epa_orchestrator.daemon_handler.get_memory_summary")
     def test_hp_capacity_success(self, mock_summary):
@@ -484,6 +487,18 @@ class TestDaemonIntegration:
                 num_of_cores=2,
             )
         )
+        with pytest.raises(ValueError):
+            _ = handle_allocate_numa_cores(
+                AllocateNumaCoresRequest(
+                    service_name="svc-b-numa",
+                    action=ActionType.ALLOCATE_NUMA_CORES,
+                    numa_node=0,
+                    num_of_cores=2,
+                )
+            )
+
+        assert allocations_db.get_allocation("svc-a-numa") == "0-1"
+
         r = handle_allocate_numa_cores(
             AllocateNumaCoresRequest(
                 service_name="svc-a-numa",
@@ -492,9 +507,19 @@ class TestDaemonIntegration:
                 num_of_cores=-1,
             )
         )
+        _ = handle_allocate_numa_cores(
+            AllocateNumaCoresRequest(
+                service_name="svc-b-numa",
+                action=ActionType.ALLOCATE_NUMA_CORES,
+                numa_node=0,
+                num_of_cores=2,
+            )
+        )
         assert r.cores_allocated == ""
         a = _get_service_entry("svc-a-numa")
         assert a is None or int(a.get("cores_count", 0)) == 0
+        assert allocations_db.get_allocation("svc-b-numa") == "0-1"
+        assert not allocations_db.get_allocation("svc-a-numa")
 
     @patch("epa_orchestrator.daemon_handler.calculate_cpu_pinning", return_value=("", ""))
     @patch("epa_orchestrator.cpu_pinning.get_isolated_cpus", return_value="0-3")
@@ -515,13 +540,247 @@ class TestDaemonIntegration:
     @patch("epa_orchestrator.daemon_handler.get_isolated_cpus", return_value="0-3")
     @patch("epa_orchestrator.cpu_pinning.get_isolated_cpus", return_value="0-3")
     def test_allocate_cores_negative_request(self, mock_iso_cp, mock_iso_dh):
-        """Negative num_of_cores defers to default policy; expect successful allocation."""
+        """Non-NUMA deallocation (-1) clears service allocation and frees CPUs for others.
+
+        Flow:
+          - Allocate 2 cores to svc-a.
+          - svc-b requesting 3 cores should fail (insufficient free).
+          - Deallocate svc-a with -1.
+          - svc-b requesting 2 cores should now succeed.
+        """
         allocations_db.clear_all_allocations()
-        r = handle_allocate_cores(
+
+        # Allocate two cores to service A
+        r1 = handle_allocate_cores(
             AllocateCoresRequest(
-                service_name="svc-neg",
+                service_name="svc-a-core",
+                action=ActionType.ALLOCATE_CORES,
+                num_of_cores=2,
+            )
+        )
+        assert r1.cores_allocated == 2
+
+        # Service B over-asks given remaining free CPUs -> expect failure
+        with pytest.raises(ValueError):
+            _ = handle_allocate_cores(
+                AllocateCoresRequest(
+                    service_name="svc-b-core",
+                    action=ActionType.ALLOCATE_CORES,
+                    num_of_cores=3,
+                )
+            )
+
+        # Deallocate service A with -1
+        r2 = handle_allocate_cores(
+            AllocateCoresRequest(
+                service_name="svc-a-core",
                 action=ActionType.ALLOCATE_CORES,
                 num_of_cores=-1,
             )
         )
-        assert r.cores_allocated > 0
+        assert r2.cores_allocated == 0
+        assert allocations_db.get_allocation("svc-a-core") is None
+
+        # Now service B should succeed within available free CPUs
+        r3 = handle_allocate_cores(
+            AllocateCoresRequest(
+                service_name="svc-b-core",
+                action=ActionType.ALLOCATE_CORES,
+                num_of_cores=2,
+            )
+        )
+        assert r3.cores_allocated == 2
+        assert allocations_db.get_snap_allocation_count("svc-b-core") == 2
+
+    @patch("epa_orchestrator.daemon_handler.get_isolated_cpus", return_value="0-3")
+    def test_core_allocation_exclusive(self, mock_iso_cp):
+        """Core allocation must be exclusive across services."""
+        allocations_db.clear_all_allocations()
+
+        r1 = handle_allocate_cores(
+            AllocateCoresRequest(
+                service_name="svc_a", action=ActionType.ALLOCATE_CORES, num_of_cores=1
+            )
+        )
+        r2 = handle_allocate_cores(
+            AllocateCoresRequest(
+                service_name="svc_b", action=ActionType.ALLOCATE_CORES, num_of_cores=2
+            )
+        )
+        assert r1.cores_allocated == 1
+        assert r2.cores_allocated == 2
+
+        # Third request should fail as svc_c overlaps with svc_b
+        with pytest.raises(ValueError):
+            _ = handle_allocate_cores(
+                AllocateCoresRequest(
+                    service_name="svc_c",
+                    action=ActionType.ALLOCATE_CORES,
+                    num_of_cores=2,
+                )
+            )
+
+        assert allocations_db.get_allocation("svc_a") == "0"
+        assert allocations_db.get_allocation("svc_b") == "1-2"
+        assert "svc_c" not in allocations_db.get_all_allocations()
+
+        # Fourth request should succeed as svc_c does not overlap with svc_b
+        r3 = handle_allocate_cores(
+            AllocateCoresRequest(
+                service_name="svc_c",
+                action=ActionType.ALLOCATE_CORES,
+                num_of_cores=1,
+            )
+        )
+        assert r3.cores_allocated == 1
+        assert allocations_db.get_allocation("svc_c") == "3"
+
+    @patch("epa_orchestrator.utils.get_numa_node_cpus", return_value={0: {0, 1, 2}, 1: {3, 4, 5}})
+    @patch(
+        "epa_orchestrator.daemon_handler.get_numa_node_cpus",
+        return_value={0: {0, 1, 2}, 1: {3, 4, 5}},
+    )
+    @patch("epa_orchestrator.allocations_db.get_isolated_cpus", return_value="0-5")
+    @patch("epa_orchestrator.daemon_handler.get_isolated_cpus", return_value="0-5")
+    def test_numa_allocation_exclusive(
+        self, mock_iso_dh, mock_iso_db, mock_nodes_dh, mock_nodes_utils
+    ):
+        """Numa allocation must be exclusive across services."""
+        allocations_db.clear_all_allocations()
+
+        r1 = handle_allocate_numa_cores(
+            AllocateNumaCoresRequest(
+                service_name="svc_a",
+                action=ActionType.ALLOCATE_NUMA_CORES,
+                numa_node=0,
+                num_of_cores=1,
+            )
+        )
+
+        r2 = handle_allocate_numa_cores(
+            AllocateNumaCoresRequest(
+                service_name="svc_b",
+                action=ActionType.ALLOCATE_NUMA_CORES,
+                numa_node=0,
+                num_of_cores=2,
+            )
+        )
+
+        assert r1.cores_allocated == "0"
+        assert r2.cores_allocated == "1-2"
+
+        # Third request should fail as svc_c overlaps with svc_b
+        with pytest.raises(ValueError):
+            _ = handle_allocate_numa_cores(
+                AllocateNumaCoresRequest(
+                    service_name="svc_c",
+                    action=ActionType.ALLOCATE_NUMA_CORES,
+                    numa_node=0,
+                    num_of_cores=2,
+                )
+            )
+
+        assert allocations_db.get_allocation("svc_a") == "0"
+        assert allocations_db.get_allocation("svc_b") == "1-2"
+        assert r1.cores_allocated == "0"
+        assert r2.cores_allocated == "1-2"
+        assert "svc_c" not in allocations_db.get_all_allocations()
+
+        # Fourth request should succeed as svc_c does not overlap with svc_b
+        r3 = handle_allocate_numa_cores(
+            AllocateNumaCoresRequest(
+                service_name="svc_c",
+                action=ActionType.ALLOCATE_NUMA_CORES,
+                numa_node=1,
+                num_of_cores=2,
+            )
+        )
+        assert r3.cores_allocated == "3-4"
+        assert allocations_db.get_allocation("svc_c") == "3-4"
+
+    @patch("epa_orchestrator.daemon_handler.get_memory_summary")
+    def test_allocate_hugepages_delta_validation(self, mock_summary):
+        """Replacing an existing hugepage request should validate by delta, not sum.
+
+        Flow:
+          - First request: set to 7 (free is ample) -> success.
+          - Second request: set to 5 with free=0 -> success (delta -2, allowed).
+          - Third request: set back to 7 with free=2 -> success (delta +2 == free).
+          - Fourth request: set to 11 with free=1 -> error (delta +4 > free).
+        """
+        # Sequence of capacity snapshots per call
+        mock_summary.side_effect = [
+            # 1) Free capacity is 10
+            {
+                "numa_hugepages": {
+                    "node0": {
+                        "capacity": [{"total": 10, "free": 10, "size": 2048}],
+                        "allocations": {},
+                    }
+                }
+            },
+            # 2) Free capacity is 0 (still allow reduction)
+            {
+                "numa_hugepages": {
+                    "node0": {
+                        "capacity": [{"total": 10, "free": 0, "size": 2048}],
+                        "allocations": {},
+                    }
+                }
+            },
+            # 3) Free capacity is 2 (increase by +2 should succeed)
+            {
+                "numa_hugepages": {
+                    "node0": {
+                        "capacity": [{"total": 10, "free": 2, "size": 2048}],
+                        "allocations": {},
+                    }
+                }
+            },
+            # 4) Free capacity is 1 (increase by +4 should fail)
+            {
+                "numa_hugepages": {
+                    "node0": {
+                        "capacity": [{"total": 10, "free": 1, "size": 2048}],
+                        "allocations": {},
+                    }
+                }
+            },
+        ]
+
+        # First set request to 7
+        req1 = {
+            "version": "1.0",
+            "service_name": "svc-delta",
+            "action": "allocate_hugepages",
+            "hugepages_requested": 7,
+            "node_id": 0,
+            "size_kb": 2048,
+        }
+        resp1_b = handle_daemon_request(json.dumps(req1).encode())
+        resp1 = parse_obj_as(AllocateHugepagesResponse, json.loads(resp1_b.decode()))
+        assert resp1.allocation_successful is True
+        assert resp1.hugepages_requested == 7
+
+        # Now replace with 5 while free=0 (delta -2): should succeed
+        req2 = dict(req1)
+        req2["hugepages_requested"] = 5
+        resp2_b = handle_daemon_request(json.dumps(req2).encode())
+        resp2 = parse_obj_as(AllocateHugepagesResponse, json.loads(resp2_b.decode()))
+        assert resp2.allocation_successful is True
+        assert resp2.hugepages_requested == 5
+
+        # Increase back to 7 while free=2 (delta +2 == free): should succeed
+        req3 = dict(req1)
+        req3["hugepages_requested"] = 7
+        resp3_b = handle_daemon_request(json.dumps(req3).encode())
+        resp3 = parse_obj_as(AllocateHugepagesResponse, json.loads(resp3_b.decode()))
+        assert resp3.allocation_successful is True
+        assert resp3.hugepages_requested == 7
+
+        # Now over-ask: set to 11 while free=1 (delta +4 > free): should error
+        req4 = dict(req1)
+        req4["hugepages_requested"] = 11
+        resp4_b = handle_daemon_request(json.dumps(req4).encode())
+        err4 = parse_obj_as(ErrorResponse, json.loads(resp4_b.decode()))
+        assert "requested additional" in err4.error

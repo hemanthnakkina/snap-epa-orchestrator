@@ -10,10 +10,10 @@ from epa_orchestrator import hugepages_db
 
 @pytest.fixture(autouse=True)
 def reset_db():
-    """Reset the hugepages database before and after each test."""
-    hugepages_db._allocations.clear()
+    """Reset the hugepages database before and after each test (persistent-safe)."""
+    hugepages_db.clear_all_allocations()
     yield
-    hugepages_db._allocations.clear()
+    hugepages_db.clear_all_allocations()
 
 
 def test_record_and_list_allocations():

@@ -5,13 +5,17 @@
 
 import json
 import logging
-from typing import Dict, List, Optional, Union, cast
+from typing import Callable, Dict, List, Optional, Tuple, Type, Union, cast
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from epa_orchestrator.allocations_db import allocations_db
 from epa_orchestrator.cpu_pinning import calculate_cpu_pinning, get_isolated_cpus
-from epa_orchestrator.hugepages_db import remove_allocation_for_key, upsert_allocation
+from epa_orchestrator.hugepages_db import (
+    list_allocations_for_node,
+    remove_allocation_for_key,
+    upsert_allocation,
+)
 from epa_orchestrator.memory_manager import get_memory_summary
 from epa_orchestrator.schemas import (
     ActionType,
@@ -29,11 +33,50 @@ from epa_orchestrator.schemas import (
     NodeHugepagesInfo,
     SnapAllocation,
 )
+from epa_orchestrator.state_store import StateCorruptionError
 from epa_orchestrator.utils import (
     _count_cpus_in_ranges,
     get_cpus_in_numa_node,
     get_numa_node_cpus,
+    to_ranges,
 )
+
+
+def _get_hugepages_context(
+    service_name: str, node_id: int, size_kb: int
+) -> Union[Tuple[int, int], ErrorResponse]:
+    """Return (free, existing_count) for node/size, or ErrorResponse on failure."""
+    summary = get_memory_summary()
+    if "error" in summary:
+        err = str(summary.get("error", "Unknown error"))
+        logging.error(f"Failed to get memory information: {err}")
+        return ErrorResponse(error=f"Failed to get memory information: {err}")
+
+    numa_hugepages = cast(Dict[str, Dict[str, object]], summary.get("numa_hugepages", {}))
+    node_key = f"node{node_id}"
+    node_info = numa_hugepages.get(node_key)
+    if not node_info:
+        return ErrorResponse(error=f"NUMA node {node_id} not found")
+
+    capacity_list = cast(List[Dict[str, int]], node_info.get("capacity", []))
+    size_entry: Optional[Dict[str, int]] = next(
+        (e for e in capacity_list if int(e.get("size", -1)) == size_kb),
+        None,
+    )
+    if not size_entry:
+        return ErrorResponse(error=f"Hugepage size {size_kb} KB not found on node {node_id}")
+
+    existing_count = 0
+    for entry in list_allocations_for_node(node_id):
+        if (
+            str(entry.get("service_name", "")) == service_name
+            and int(entry.get("size_kb", -1)) == size_kb
+        ):
+            existing_count = int(entry.get("count", 0))
+            break
+
+    free = int(size_entry.get("free", 0))
+    return free, existing_count
 
 
 def handle_allocate_cores(request: AllocateCoresRequest) -> AllocateCoresResponse:
@@ -45,22 +88,33 @@ def handle_allocate_cores(request: AllocateCoresRequest) -> AllocateCoresRespons
     if not isolated:
         raise ValueError("No CPUs available")
 
-    # Get system statistics
-    stats = allocations_db.get_system_stats(isolated)
+    if request.num_of_cores == -1:
+        allocations_db.remove_allocation(request.service_name)
+        stats = allocations_db.get_system_stats(isolated)
+        remaining_available = allocations_db.get_available_cpus(isolated)
+        remaining_shared = to_ranges(remaining_available)
+        return AllocateCoresResponse(
+            service_name=request.service_name,
+            num_of_cores=0,
+            cores_allocated=0,
+            allocated_cores="",
+            shared_cpus=remaining_shared,
+            total_available_cpus=stats["total_available_cpus"],
+            remaining_available_cpus=stats["remaining_available_cpus"],
+        )
 
     # Get requested number of cores (default policy when 0)
     num_of_cores = request.num_of_cores or 0
-
+    available_cpus = allocations_db.get_available_cpus(isolated)
     # Check if we can allocate the requested CPUs when > 0
     if num_of_cores > 0:
         if not allocations_db.can_allocate_cpus(num_of_cores, isolated):
-            available_cpus = allocations_db.get_available_cpus(isolated)
             raise ValueError(
                 f"Insufficient CPUs available. Requested: {num_of_cores}, Available: {len(available_cpus)}"
             )
 
     # Calculate CPU allocation
-    shared, dedicated = calculate_cpu_pinning(isolated, num_of_cores)
+    shared, dedicated = calculate_cpu_pinning(to_ranges(available_cpus), num_of_cores)
 
     if not dedicated:
         raise ValueError(f"Failed to allocate {num_of_cores} cores")
@@ -78,7 +132,7 @@ def handle_allocate_cores(request: AllocateCoresRequest) -> AllocateCoresRespons
         cores_allocated=cores_allocated,
         allocated_cores=dedicated,
         shared_cpus=shared,
-        total_available_cpus=stats["total_available_cpus"],
+        total_available_cpus=updated_stats["total_available_cpus"],
         remaining_available_cpus=updated_stats["remaining_available_cpus"],
     )
 
@@ -107,6 +161,7 @@ def handle_allocate_numa_cores(
             request.service_name, request.numa_node, request.num_of_cores
         )
         updated_stats = allocations_db.get_system_stats(isolated)
+
         return AllocateNumaCoresResponse(
             service_name=request.service_name,
             numa_node=request.numa_node,
@@ -167,7 +222,7 @@ def handle_get_memory_info(
             return ErrorResponse(error=f"Failed to get memory information: {err}")
         numa_map = cast(Dict[str, NodeHugepagesInfo], memory_summary.get("numa_hugepages", {}))
         return MemoryInfoResponse(
-            service_name=request.service_name,
+            service_name=request.service_name or "",
             numa_hugepages=numa_map,
         )
     except Exception as e:
@@ -201,34 +256,18 @@ def handle_allocate_hugepages(
 
         # Capacity validation for positive requests
         if request.hugepages_requested > 0:
-            summary = get_memory_summary()
-            if "error" in summary:
-                err = str(summary.get("error", "Unknown error"))
-                logging.error(f"Failed to get memory information: {err}")
-                return ErrorResponse(error=f"Failed to get memory information: {err}")
+            ctx = _get_hugepages_context(request.service_name, request.node_id, request.size_kb)
+            if isinstance(ctx, ErrorResponse):
+                return ctx
+            free, existing_count = ctx
 
-            numa_hugepages = cast(Dict[str, Dict[str, object]], summary.get("numa_hugepages", {}))
-            node_key = f"node{request.node_id}"
-            node_info = numa_hugepages.get(node_key)
-            if not node_info:
-                return ErrorResponse(error=f"NUMA node {request.node_id} not found")
-
-            capacity_list = cast(List[Dict[str, int]], node_info.get("capacity", []))
-            size_entry: Optional[Dict[str, int]] = next(
-                (e for e in capacity_list if int(e.get("size", -1)) == request.size_kb),
-                None,
-            )
-            if not size_entry:
-                return ErrorResponse(
-                    error=f"Hugepage size {request.size_kb} KB not found on node {request.node_id}"
-                )
-
-            free = int(size_entry.get("free", 0))
-            if free < request.hugepages_requested:
+            # Only additional increase beyond existing requires free capacity
+            delta = int(request.hugepages_requested) - int(existing_count)
+            if delta > 0 and free < delta:
                 return ErrorResponse(
                     error=(
                         f"NUMA node {request.node_id} size {request.size_kb} KB only has {free} "
-                        f"free hugepages, requested {request.hugepages_requested}"
+                        f"free hugepages, requested additional {delta}"
                     )
                 )
 
@@ -296,84 +335,45 @@ def handle_list_allocations(request: ListAllocationsRequest) -> ListAllocationsR
 
 
 def handle_daemon_request(data: bytes) -> bytes:
-    """Handle daemon request.
-
-    Args:
-        data: The request data
-
-    Returns:
-        The response data
-    """
+    """Handle daemon request."""
     try:
         request_data = json.loads(data.decode())
         action_value = request_data.get("action")
 
-        response: Union[
-            AllocateCoresResponse,
-            AllocateNumaCoresResponse,
-            ListAllocationsResponse,
-            MemoryInfoResponse,
-            AllocateHugepagesResponse,
-            ErrorResponse,
-        ]
+        dispatcher: Dict[str, Tuple[Type[BaseModel], Callable[..., BaseModel]]] = {
+            ActionType.ALLOCATE_CORES.value: (AllocateCoresRequest, handle_allocate_cores),
+            ActionType.ALLOCATE_NUMA_CORES.value: (
+                AllocateNumaCoresRequest,
+                handle_allocate_numa_cores,
+            ),
+            ActionType.LIST_ALLOCATIONS.value: (ListAllocationsRequest, handle_list_allocations),
+            ActionType.GET_MEMORY_INFO.value: (GetMemoryInfoRequest, handle_get_memory_info),
+            ActionType.ALLOCATE_HUGEPAGES.value: (
+                AllocateHugepagesRequest,
+                handle_allocate_hugepages,
+            ),
+        }
 
-        if action_value in (
-            ActionType.ALLOCATE_CORES,
-            ActionType.ALLOCATE_CORES.value,
-            "allocate_cores",
-        ):
-            ac_req: AllocateCoresRequest = AllocateCoresRequest.parse_obj(request_data)
-            response = handle_allocate_cores(ac_req)
-        elif action_value in (
-            ActionType.ALLOCATE_NUMA_CORES,
-            ActionType.ALLOCATE_NUMA_CORES.value,
-            "allocate_numa_cores",
-        ):
-            numa_req: AllocateNumaCoresRequest = AllocateNumaCoresRequest.parse_obj(request_data)
-            response = handle_allocate_numa_cores(numa_req)
-        elif action_value in (
-            ActionType.LIST_ALLOCATIONS,
-            ActionType.LIST_ALLOCATIONS.value,
-            "list_allocations",
-        ):
-            la_req: ListAllocationsRequest = ListAllocationsRequest.parse_obj(request_data)
-            response = handle_list_allocations(la_req)
-        elif action_value in (
-            ActionType.GET_MEMORY_INFO,
-            ActionType.GET_MEMORY_INFO.value,
-            "get_memory_info",
-        ):
-            mem_req: GetMemoryInfoRequest = GetMemoryInfoRequest.parse_obj(request_data)
-            response = handle_get_memory_info(mem_req)
-        elif action_value in (
-            ActionType.ALLOCATE_HUGEPAGES,
-            ActionType.ALLOCATE_HUGEPAGES.value,
-            "allocate_hugepages",
-        ):
-            hp_req: AllocateHugepagesRequest = AllocateHugepagesRequest.parse_obj(request_data)
-            response = handle_allocate_hugepages(hp_req)
-        else:
-            response = ErrorResponse(
-                error=f"Unknown action: {action_value}",
-                version="1.0",
-            )
+        # Normalize action to string value
+        key = action_value.value if isinstance(action_value, ActionType) else str(action_value)
+        entry = dispatcher.get(key)
+        if not entry:
+            response = ErrorResponse(error=f"Unknown action: {action_value}", version="1.0")
+            return response.json().encode()
 
-        return response.json().encode()
+        schema_cls, handler_fn = entry
+        req_obj: BaseModel = schema_cls.parse_obj(request_data)
+        resp_obj: BaseModel = handler_fn(req_obj)
+        return resp_obj.json().encode()
+    except StateCorruptionError:
+        # Let corruption crash the daemon so the charm can block/alert
+        raise
     except (ValidationError, json.JSONDecodeError) as e:
-        error_response = ErrorResponse(
-            error=str(e),
-            version="1.0",
-        )
+        error_response = ErrorResponse(error=str(e), version="1.0")
         return error_response.json().encode()
     except ValueError as e:
-        error_response = ErrorResponse(
-            error=str(e),
-            version="1.0",
-        )
+        error_response = ErrorResponse(error=str(e), version="1.0")
         return error_response.json().encode()
     except Exception as e:
-        error_response = ErrorResponse(
-            error=str(e),
-            version="1.0",
-        )
+        error_response = ErrorResponse(error=str(e), version="1.0")
         return error_response.json().encode()

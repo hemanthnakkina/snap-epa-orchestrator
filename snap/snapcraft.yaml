@@ -20,6 +20,11 @@ apps:
     slots:
       - epa-info
 
+  daily-backup:
+    command: usr/sbin/logrotate -s $SNAP_DATA/logrotate.status $SNAP/etc/logrotate.d/state-json
+    daemon: oneshot
+    timer: 00:00
+
 parts:
   bin:
     source: bin/
@@ -33,6 +38,21 @@ parts:
     python-packages:
       - pydantic
       - .
+
+  logrotate:
+    plugin: nil
+    stage-packages:
+      - logrotate
+
+  logrotate-conf:
+    plugin: dump
+    source: snap/local/logrotate.conf
+    source-type: file
+    organize:
+      logrotate.conf: etc/logrotate.d/state-json
+    override-prime: |
+      craftctl default
+      chmod 0644 "$SNAPCRAFT_PRIME/etc/logrotate.d/state-json"
 
 slots:
   epa-info:

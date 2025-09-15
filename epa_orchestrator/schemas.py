@@ -39,7 +39,10 @@ class ListAllocationsRequest(BaseModel):
 
     version: Literal["1.0"] = Field(default=API_VERSION)
     action: Literal[ActionType.LIST_ALLOCATIONS]
-    service_name: str = Field(description="Name of the requesting service")
+    service_name: Optional[str] = Field(
+        default=None,
+        description="Name of the requesting service (optional)",
+    )
 
 
 class AllocateNumaCoresRequest(BaseModel):
@@ -63,7 +66,10 @@ class GetMemoryInfoRequest(BaseModel):
 
     version: Literal["1.0"] = Field(default=API_VERSION)
     action: Literal[ActionType.GET_MEMORY_INFO]
-    service_name: str = Field(description="Name of the requesting service")
+    service_name: Optional[str] = Field(
+        default=None,
+        description="Name of the requesting service (optional)",
+    )
 
 
 class AllocateHugepagesRequest(BaseModel):

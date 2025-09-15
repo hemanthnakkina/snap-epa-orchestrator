@@ -1,13 +1,14 @@
 # SPDX-FileCopyrightText: 2024 - Canonical Ltd
 # SPDX-License-Identifier: Apache-2.0
 
-"""In-memory database for tracking snap CPU allocations."""
+"""Database for tracking snap CPU allocations."""
 
 import logging
 from typing import Dict, Optional, Set, Tuple
 
 from .cpu_pinning import get_isolated_cpus
 from .schemas import SnapAllocation
+from .state_store import StateStore
 from .utils import get_cpus_in_numa_node, parse_cpu_ranges, to_ranges
 
 
@@ -21,6 +22,8 @@ class AllocationsDB:
         self._explicit_allocations: Dict[str, str] = {}
         self._explicitly_allocated_cpus: Set[int] = set()
         logging.info("Allocations database initialized")
+        self._state_store: StateStore = StateStore()
+        self._load_from_store()
 
     def _parse_cpu_ranges(self, cpu_ranges: str) -> set[int]:
         """Parse CPU range string into a set of CPU numbers."""
@@ -37,6 +40,45 @@ class AllocationsDB:
             old_explicit = self._parse_cpu_ranges(self._explicit_allocations.pop(service_name))
             self._explicitly_allocated_cpus -= old_explicit
         return removed
+
+    def _snapshot(self) -> Dict[str, object]:
+        """Return a JSON-serializable snapshot of current state."""
+        return {
+            "allocations": dict(self._allocations),
+            "explicit_allocations": dict(self._explicit_allocations),
+        }
+
+    def _persist(self) -> None:
+        try:
+            self._state_store.update_section("allocations_db", self._snapshot())
+        except Exception as e:
+            logging.error(f"Failed to persist allocations state: {e}")
+
+    def _load_from_store(self) -> None:
+        try:
+            data = self._state_store.read_section("allocations_db")
+        except Exception as e:
+            logging.error(f"Failed to read allocations state: {e}")
+            data = {}
+
+        allocations = data.get("allocations")
+        explicit_allocations = data.get("explicit_allocations")
+
+        if isinstance(allocations, dict):
+            self._allocations = {str(k): str(v) for k, v in allocations.items()}
+        else:
+            self._allocations = {}
+        if isinstance(explicit_allocations, dict):
+            self._explicit_allocations = {str(k): str(v) for k, v in explicit_allocations.items()}
+        else:
+            self._explicit_allocations = {}
+
+        self._allocated_cpus = set()
+        self._explicitly_allocated_cpus = set()
+        for cores_str in self._allocations.values():
+            self._allocated_cpus.update(self._parse_cpu_ranges(cores_str))
+        for cores_str in self._explicit_allocations.values():
+            self._explicitly_allocated_cpus.update(self._parse_cpu_ranges(cores_str))
 
     def _apply_allocation(self, service_name: str, cpu_set: set[int], explicit: bool) -> None:
         """Apply an allocation to a service, updating all tracking structures."""
@@ -84,6 +126,7 @@ class AllocationsDB:
         Returns:
             List of available CPU numbers
         """
+        self._load_from_store()
         all_cpus = self._parse_cpu_ranges(total_cpus)
         available_cpus = sorted(list(all_cpus - self._allocated_cpus))
         return available_cpus
@@ -98,6 +141,7 @@ class AllocationsDB:
         Returns:
             True if allocation is possible, False otherwise
         """
+        self._load_from_store()
         available_cpus = self.get_available_cpus(total_cpus)
         return len(available_cpus) >= requested_count
 
@@ -108,13 +152,22 @@ class AllocationsDB:
             service_name: Name of the service
             allocated_cores: Comma-separated list of CPU ranges allocated to the service
         """
+        self._load_from_store()
         if not allocated_cores:
             logging.warning(f"No cores allocated to service {service_name}")
             return
+        # Remove previous allocation for this service first
         self._remove_service_allocation(service_name)
         new_cpu_set = self._parse_cpu_ranges(allocated_cores)
+        # Enforce exclusivity: reject overlap with CPUs already allocated to other services
+        overlap = new_cpu_set & self._allocated_cpus
+        if overlap:
+            raise ValueError(
+                f"Requested CPUs {to_ranges(sorted(list(overlap)))} are already allocated to other services"
+            )
         self._apply_allocation(service_name, new_cpu_set, explicit=False)
         logging.info(f"Allocated cores {allocated_cores} to service {service_name}")
+        self._persist()
 
     def _get_allocatable_numa_cpus(
         self, service_name: str, numa_node: int, isolated_cpus_str: str
@@ -153,15 +206,11 @@ class AllocationsDB:
 
     def _get_service_allocation_set(self, service_name: str) -> set[int]:
         """Return current allocation set for a service (empty if none)."""
-        if service_name not in self._allocations:
-            return set()
-        return self._parse_cpu_ranges(self._allocations[service_name])
+        return self._parse_cpu_ranges(self._allocations.get(service_name, ""))
 
     def _get_service_explicit_set(self, service_name: str) -> set[int]:
         """Return current explicit allocation set for a service (empty if none)."""
-        if service_name not in self._explicit_allocations:
-            return set()
-        return self._parse_cpu_ranges(self._explicit_allocations[service_name])
+        return self._parse_cpu_ranges(self._explicit_allocations.get(service_name, ""))
 
     def _apply_numa_explicit_allocation(
         self,
@@ -208,6 +257,7 @@ class AllocationsDB:
         - num_of_cores == -1: deallocate existing cores for this service in the node
         - num_of_cores == 0: invalid; returns no-op ("", "")
         """
+        self._load_from_store()
         isolated_cpus = get_isolated_cpus()
 
         if num_of_cores == 0:
@@ -222,6 +272,7 @@ class AllocationsDB:
             in_node_explicit = get_cpus_in_numa_node(numa_node, prev_explicit_str)
             if in_node_explicit:
                 self._subtract_cpus_from_service(service_name, set(in_node_explicit))
+            self._persist()
             return "", ""
 
         allocatable_cpus, rejected_cpus = self._get_allocatable_numa_cpus(
@@ -255,7 +306,7 @@ class AllocationsDB:
             logging.info(
                 f"Appended NUMA node {numa_node} allocation for service {service_name}: {allocated_cores_str}"
             )
-
+        self._persist()
         return allocated_cores_str, ""
 
     def get_allocation(self, service_name: str) -> Optional[str]:
@@ -267,6 +318,7 @@ class AllocationsDB:
         Returns:
             Comma-separated list of CPU ranges allocated to the service, or None if not found
         """
+        self._load_from_store()
         return self._allocations.get(service_name)
 
     def is_explicit_allocation(self, service_name: str) -> bool:
@@ -278,6 +330,7 @@ class AllocationsDB:
         Returns:
             True if the service has an explicit allocation, False otherwise
         """
+        self._load_from_store()
         return service_name in self._explicit_allocations
 
     def get_all_allocations(self) -> list[SnapAllocation]:
@@ -286,6 +339,7 @@ class AllocationsDB:
         Returns:
             List of SnapAllocation objects
         """
+        self._load_from_store()
         return [
             SnapAllocation(
                 service_name=service_name,
@@ -305,19 +359,23 @@ class AllocationsDB:
         Returns:
             True if allocation was removed, False if not found
         """
+        self._load_from_store()
         if service_name in self._allocations or service_name in self._explicit_allocations:
             self._remove_service_allocation(service_name)
             logging.info(f"Removed allocation for service {service_name}")
+            self._persist()
             return True
         return False
 
     def clear_all_allocations(self) -> None:
         """Clear all allocations."""
+        self._load_from_store()
         self._allocations.clear()
         self._allocated_cpus.clear()
         self._explicit_allocations.clear()
         self._explicitly_allocated_cpus.clear()
         logging.info("Cleared all allocations")
+        self._persist()
 
     def get_total_allocated_count(self) -> int:
         """Get the total number of allocated CPUs.
@@ -325,6 +383,7 @@ class AllocationsDB:
         Returns:
             Number of allocated CPUs
         """
+        self._load_from_store()
         return len(self._allocated_cpus)
 
     def get_snap_allocation_count(self, service_name: str) -> int:
@@ -336,6 +395,7 @@ class AllocationsDB:
         Returns:
             Number of CPUs allocated to the service, or 0 if not found
         """
+        self._load_from_store()
         allocation = self._allocations.get(service_name)
         if allocation:
             return len(self._parse_cpu_ranges(allocation))
@@ -350,6 +410,7 @@ class AllocationsDB:
         Returns:
             Dictionary with system statistics
         """
+        self._load_from_store()
         total_available = len(self._parse_cpu_ranges(total_cpus))
         total_allocated = len(self._allocated_cpus)
         remaining_available = total_available - total_allocated

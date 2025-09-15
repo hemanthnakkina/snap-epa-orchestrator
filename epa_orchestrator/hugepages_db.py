@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2024 - Canonical Ltd
 # SPDX-License-Identifier: Apache-2.0
 
-"""In-memory tracking of hugepage allocation requests per service."""
+"""Tracking of hugepage allocation requests per service."""
 
 import logging
 from typing import Dict, List, Optional, Union
@@ -11,10 +11,52 @@ from epa_orchestrator.schemas import (
     NodeHugepageAllocation,
     ServiceHugepageAllocations,
 )
+from epa_orchestrator.state_store import StateStore
 
 # Structure: service_name -> list of allocations
 # allocation: {"node_id": int, "size_kb": int, "count": int}
 _allocations: Dict[str, List[Dict[str, int]]] = {}
+_store: StateStore = StateStore()
+
+
+def _persist() -> None:
+    try:
+        snapshot = {k: [dict(e) for e in v] for k, v in _allocations.items()}
+        _store.update_section("hugepages_db", {"allocations": snapshot})
+    except Exception as e:
+        logging.error(f"Failed to persist hugepages state: {e}")
+
+
+def _load_from_store() -> None:
+    try:
+        data = _store.read_section("hugepages_db")
+    except Exception as e:
+        logging.error(f"Failed to read hugepages state: {e}")
+        data = {}
+
+    raw = data.get("allocations")
+    if isinstance(raw, dict):
+        restored: Dict[str, List[Dict[str, int]]] = {}
+        for svc, entries in raw.items():
+            if not isinstance(entries, list):
+                continue
+            valid_entries: List[Dict[str, int]] = []
+            for entry in entries:
+                try:
+                    obj = HugepageAllocationEntry(**entry)
+                    valid_entries.append(
+                        {"node_id": obj.node_id, "size_kb": obj.size_kb, "count": obj.count}
+                    )
+                except Exception:
+                    continue
+            if valid_entries:
+                restored[str(svc)] = valid_entries
+        _allocations.clear()
+        _allocations.update(restored)
+
+
+# Load persisted state at import time
+_load_from_store()
 
 
 def upsert_allocation(service_name: str, node_id: int, size_kb: int, count: int) -> None:
@@ -39,6 +81,7 @@ def upsert_allocation(service_name: str, node_id: int, size_kb: int, count: int)
     logging.info(
         f"{action} hugepage allocation for {service_name} node {node_id} size {size_kb}KB -> {count}"
     )
+    _persist()
 
 
 def list_allocations() -> Dict[str, List[Dict[str, int]]]:
@@ -86,6 +129,7 @@ def clear_all_allocations() -> None:
     """Clear all allocations."""
     _allocations.clear()
     logging.info("Cleared all hugepage allocations")
+    _persist()
 
 
 def remove_allocation_for_key(service_name: str, node_id: int, size_kb: int) -> bool:
@@ -109,4 +153,5 @@ def remove_allocation_for_key(service_name: str, node_id: int, size_kb: int) -> 
         logging.info(
             f"Removed hugepage allocation records for {service_name} node {node_id} size {size_kb}KB"
         )
+        _persist()
     return removed

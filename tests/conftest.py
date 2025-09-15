@@ -3,13 +3,17 @@
 
 """Shared pytest fixtures for EPA Orchestrator tests."""
 
+import importlib
+import os
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-from epa_orchestrator.allocations_db import AllocationsDB
+import epa_orchestrator.allocations_db as allocations_db_mod
+import epa_orchestrator.hugepages_db as hugepages_db
+import epa_orchestrator.state_store as state_store
 
 
 @pytest.fixture
@@ -17,6 +21,43 @@ def temp_dir():
     """Create a temporary directory for testing."""
     with tempfile.TemporaryDirectory() as tmp_dir:
         yield Path(tmp_dir)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def setup_env_and_reload_modules(tmp_path_factory):
+    """Set SNAP_DATA to a temp dir and reload modules once per session.
+
+    This ensures persistence writes/read go to an isolated directory while
+    keeping imports at the top of the file.
+    """
+    temp_base = tmp_path_factory.mktemp("epa-state")
+    os.environ["SNAP_DATA"] = str(temp_base)
+    # Reload modules that depend on SNAP_DATA/state at import time
+    importlib.reload(state_store)
+    importlib.reload(hugepages_db)
+    importlib.reload(allocations_db_mod)
+
+
+@pytest.fixture(autouse=True)
+def reset_persistent_state():
+    """Reset both CPU and hugepages persistent state before and after each test."""
+    try:
+        hugepages_db.clear_all_allocations()
+    except Exception:
+        pass
+    try:
+        allocations_db_mod.allocations_db.clear_all_allocations()
+    except Exception:
+        pass
+    yield
+    try:
+        hugepages_db.clear_all_allocations()
+    except Exception:
+        pass
+    try:
+        allocations_db_mod.allocations_db.clear_all_allocations()
+    except Exception:
+        pass
 
 
 @pytest.fixture
@@ -76,13 +117,13 @@ def mock_cpu_files_missing(temp_dir):
 @pytest.fixture
 def fresh_allocations_db():
     """Create a fresh AllocationsDB instance for testing."""
-    return AllocationsDB()
+    return allocations_db_mod.AllocationsDB()
 
 
 @pytest.fixture
 def populated_allocations_db():
     """Create an AllocationsDB instance with some test allocations."""
-    db = AllocationsDB()
+    db = allocations_db_mod.AllocationsDB()
     db.allocate_cores("test-service-1", "0-1")
     db.allocate_cores("test-service-2", "2,4")
     return db
