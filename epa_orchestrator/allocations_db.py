@@ -55,11 +55,8 @@ class AllocationsDB:
             logging.error(f"Failed to persist allocations state: {e}")
 
     def _load_from_store(self) -> None:
-        try:
-            data = self._state_store.read_section("allocations_db")
-        except Exception as e:
-            logging.error(f"Failed to read allocations state: {e}")
-            data = {}
+
+        data = self._state_store.read_section("allocations_db")
 
         allocations = data.get("allocations")
         explicit_allocations = data.get("explicit_allocations")
