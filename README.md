@@ -36,6 +36,7 @@ The NUMA-aware allocation action allows services to request a specific number of
 - **Priority System**: NUMA allocations take precedence over automatic allocations and cannot be overridden by other services.
 - **Per-NUMA override/append semantics**: If the same service requests the same NUMA node again, it overrides previous cores from that node. If it requests a different NUMA node, the new cores are appended so the service may hold allocations across multiple NUMA nodes.
 - **Per-NUMA deallocation**: Sending `num_of_cores = -1` for a node deallocates any existing cores for that service in that node. `num_of_cores = 0` is invalid for NUMA.
+ - **SMT/Hyperthreading-aware allocation**: Within the requested NUMA node, allocation prefers full physical cores (both hyperthreads) when available, and then fills any remainder with single logical CPUs from other cores.
 
 ### Planned Features
 

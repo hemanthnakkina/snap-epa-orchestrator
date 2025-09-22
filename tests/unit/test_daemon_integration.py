@@ -784,3 +784,56 @@ class TestDaemonIntegration:
         resp4_b = handle_daemon_request(json.dumps(req4).encode())
         err4 = parse_obj_as(ErrorResponse, json.loads(resp4_b.decode()))
         assert "requested additional" in err4.error
+
+    @patch("epa_orchestrator.daemon_handler.get_isolated_cpus", return_value="0-7")
+    @patch("epa_orchestrator.allocations_db.get_isolated_cpus", return_value="0-7")
+    @patch("epa_orchestrator.utils.get_numa_node_cpus", return_value={0: {0, 1, 2, 3, 4, 5, 6, 7}})
+    @patch(
+        "epa_orchestrator.daemon_handler.get_numa_node_cpus",
+        return_value={0: {0, 1, 2, 3, 4, 5, 6, 7}},
+    )
+    def test_numa_smt_prefers_pairs_then_singles(
+        self, mock_nodes_dh, mock_nodes_utils, mock_iso_db, mock_iso_dh
+    ):
+        """NUMA allocator should prefer full sibling pairs, then fill with singles (no blocking).
+
+        Scenario: Node0 has CPUs 0-7 forming pairs (0,1), (2,3), (4,5), (6,7).
+        Request 5 CPUs -> expect two full pairs and one single from a third pair.
+        """
+        allocations_db.clear_all_allocations()
+
+        # Patch thread siblings mapping via cpu_pinning helper
+        def fake_read_file(path: str) -> str:
+            # Extract cpu number from path like .../cpuN/topology/thread_siblings_list
+            try:
+                i = path.rfind("/cpu")
+                j = path.find("/", i + 4)
+                cpu_str = path[i + 4 : j]
+                n = int(cpu_str)
+                base = n - (n % 2)
+                return f"{base}-{base + 1}"
+            except Exception:
+                return ""
+
+        with patch("epa_orchestrator.cpu_pinning._read_file_strict", side_effect=fake_read_file):
+            r = handle_allocate_numa_cores(
+                AllocateNumaCoresRequest(
+                    service_name="svc-smt",
+                    action=ActionType.ALLOCATE_NUMA_CORES,
+                    numa_node=0,
+                    num_of_cores=5,
+                )
+            )
+
+        # Validate allocation count
+        allocated_set = parse_cpu_ranges(r.cores_allocated)
+        assert len(allocated_set) == 5
+
+        # Validate that at least two groups are fully used (pairs), and one single remains
+        groups = [(0, 1), (2, 3), (4, 5), (6, 7)]
+        counts = []
+        for a, b in groups:
+            c = (1 if a in allocated_set else 0) + (1 if b in allocated_set else 0)
+            counts.append(c)
+        assert counts.count(2) >= 2  # two full cores used
+        assert counts.count(1) >= 1  # one single used

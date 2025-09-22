@@ -7,6 +7,15 @@ import os
 from typing import Dict, Set
 
 
+def _read_file_strict(path: str) -> str:
+    """Read a file, return stripped contents or empty string on failure."""
+    try:
+        with open(path, "r") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
 def parse_cpu_ranges(cpu_ranges: str) -> Set[int]:
     """Convert CPU range string to a set of CPU numbers.
 

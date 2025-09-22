@@ -5,10 +5,11 @@
 
 import logging
 
-from .utils import to_ranges
+from .utils import _read_file_strict, parse_cpu_ranges, to_ranges
 
 ISOLATED_CPUS_PATH = "/sys/devices/system/cpu/isolated"
 PRESENT_CPUS_PATH = "/sys/devices/system/cpu/present"
+THREAD_SIBLINGS_LIST_TEMPLATE = "/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
 MAX_ALLOCATION_PERCENTAGE = 80  # Maximum percentage of CPUs that can be allocated
 LARGE_SYSTEM_THRESHOLD = 100  # Threshold for considering a system "large"
 RESERVED_CORES_LARGE_SYSTEM = 16  # Number of cores to reserve on large systems
@@ -30,6 +31,31 @@ def get_isolated_cpus() -> str:
     except Exception as e:
         logging.error(f"Failed to get CPU information: {e}")
     return ""
+
+
+def get_thread_siblings_map(cpus: set[int]) -> dict[int, set[int]]:
+    """Return mapping of each CPU to its thread siblings.
+
+    Summary:
+    - Includes the CPU itself.
+    - Intersected with the provided CPU set.
+    - Uses thread_siblings_list from sysfs.
+    - Falls back to a singleton set if topology is unavailable.
+    """
+    result: dict[int, set[int]] = {}
+    if not cpus:
+        return result
+
+    for cpu in sorted(cpus):
+        path = THREAD_SIBLINGS_LIST_TEMPLATE.format(cpu=cpu)
+        content = _read_file_strict(path)
+        if content:
+            siblings_all = parse_cpu_ranges(content)
+            siblings = siblings_all.intersection(cpus)
+            result[cpu] = siblings if siblings else {cpu}
+        else:
+            result[cpu] = {cpu}
+    return result
 
 
 def calculate_cpu_pinning(cpu_list: str, cores_requested: int = 0) -> "tuple[str, str]":

@@ -6,10 +6,14 @@
 import logging
 from typing import Dict, Optional, Set, Tuple
 
-from .cpu_pinning import get_isolated_cpus
+from .cpu_pinning import get_isolated_cpus, get_thread_siblings_map
 from .schemas import SnapAllocation
 from .state_store import StateStore
-from .utils import get_cpus_in_numa_node, parse_cpu_ranges, to_ranges
+from .utils import (
+    get_cpus_in_numa_node,
+    parse_cpu_ranges,
+    to_ranges,
+)
 
 
 class AllocationsDB:
@@ -279,7 +283,7 @@ class AllocationsDB:
         if len(allocatable_cpus) < num_of_cores:
             return "", to_ranges(sorted(rejected_cpus))
 
-        cores_to_allocate = set(sorted(allocatable_cpus)[:num_of_cores])
+        cores_to_allocate = self._select_numa_cpus_smt_aware(allocatable_cpus, num_of_cores)
 
         prev_alloc_str = self._allocations.get(service_name, "")
         prev_in_node = get_cpus_in_numa_node(numa_node, prev_alloc_str)
@@ -305,6 +309,94 @@ class AllocationsDB:
             )
         self._persist()
         return allocated_cores_str, ""
+
+    def _select_numa_cpus_smt_aware(self, candidate_cpus: Set[int], num_of_cores: int) -> set[int]:
+        """Select exactly num_of_cores from candidates, preferring pairs then singles."""
+        groups = self._group_candidates_by_siblings(candidate_cpus)
+        selected_list = self._select_from_groups_pairs_then_singles(groups, num_of_cores)
+        return set(sorted(selected_list))
+
+    def _group_candidates_by_siblings(self, candidate_cpus: Set[int]) -> list[list[int]]:
+        """Group candidate CPUs by their thread sibling sets.
+
+        Returns a list of groups, each a sorted list of CPUs, ordered by the group's lowest CPU id.
+        Only CPUs present in candidate_cpus are included in groups.
+        """
+        if not candidate_cpus:
+            return []
+        mapping = get_thread_siblings_map(set(candidate_cpus))
+        group_to_members: dict[tuple[int, ...], list[int]] = {}
+        for cpu in sorted(candidate_cpus):
+            group_tuple = tuple(sorted(mapping.get(cpu, {cpu})))
+            if group_tuple not in group_to_members:
+                members = [m for m in group_tuple if m in candidate_cpus]
+                group_to_members[group_tuple] = sorted(members)
+        ordered_groups = [
+            group_to_members[k]
+            for k in sorted(group_to_members.keys(), key=lambda g: g[0] if g else -1)
+        ]
+        return ordered_groups
+
+    def _select_from_groups_pairs_then_singles(
+        self, groups: list[list[int]], count: int
+    ) -> list[int]:
+        """Pick CPUs by taking pairs from groups first, then singles.
+
+        Mutates the input groups (consumes members) to keep the logic simple.
+        """
+        selected: list[int] = []
+        remaining = count
+
+        pair_taken = self._take_pairs_from_groups(groups, remaining)
+        selected.extend(pair_taken)
+        remaining -= len(pair_taken)
+
+        if remaining > 0:
+            single_taken = self._take_singles_from_groups(groups, remaining)
+            selected.extend(single_taken)
+            remaining -= len(single_taken)
+
+        if remaining > 0:
+            leftovers = self._collect_leftovers(groups)
+            selected.extend(leftovers[:remaining])
+
+        return selected[:count]
+
+    def _take_pairs_from_groups(self, groups: list[list[int]], budget: int) -> list[int]:
+        """Consume up to budget CPUs in pairs (2 per group) from groups."""
+        taken: list[int] = []
+        if budget < 2:
+            return taken
+        remaining = budget
+        for members in groups:
+            if remaining < 2:
+                break
+            if len(members) >= 2:
+                taken.extend(members[:2])
+                del members[:2]
+                remaining -= 2
+        return taken
+
+    def _take_singles_from_groups(self, groups: list[list[int]], budget: int) -> list[int]:
+        """Consume up to budget CPUs one-by-one across groups."""
+        taken: list[int] = []
+        if budget <= 0:
+            return taken
+        remaining = budget
+        for members in groups:
+            if remaining == 0:
+                break
+            if members:
+                taken.append(members.pop(0))
+                remaining -= 1
+        return taken
+
+    def _collect_leftovers(self, groups: list[list[int]]) -> list[int]:
+        """Flatten remaining members across all groups in order."""
+        leftovers: list[int] = []
+        for members in groups:
+            leftovers.extend(members)
+        return leftovers
 
     def get_allocation(self, service_name: str) -> Optional[str]:
         """Get the allocated cores for a specific service.
