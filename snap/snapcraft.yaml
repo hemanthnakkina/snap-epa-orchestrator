@@ -7,7 +7,7 @@ description: |
   Provides Enhanced Platform Awareness (EPA) information, such as CPU pinning,
   via a Unix socket for consumption by other snaps.
 
-grade: devel
+grade: stable
 confinement: strict
 
 apps:
