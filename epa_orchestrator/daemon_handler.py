@@ -105,10 +105,11 @@ def handle_allocate_cores(request: AllocateCoresRequest) -> AllocateCoresRespons
 
     # Get requested number of cores (default policy when 0)
     num_of_cores = request.num_of_cores or 0
-    available_cpus = allocations_db.get_available_cpus(isolated)
+    # Use pool that includes this service's existing allocation (we are replacing it)
+    available_cpus = allocations_db.get_available_cpus_for_service(request.service_name, isolated)
     # Check if we can allocate the requested CPUs when > 0
     if num_of_cores > 0:
-        if not allocations_db.can_allocate_cpus(num_of_cores, isolated):
+        if len(available_cpus) < num_of_cores:
             raise ValueError(
                 f"Insufficient CPUs available. Requested: {num_of_cores}, Available: {len(available_cpus)}"
             )
@@ -336,8 +337,10 @@ def handle_list_allocations(request: ListAllocationsRequest) -> ListAllocationsR
 
 def handle_daemon_request(data: bytes) -> bytes:
     """Handle daemon request."""
+    response_bytes: bytes = b""
     try:
         request_data = json.loads(data.decode())
+        logging.info("EPA request: action=%s payload=%s", request_data.get("action"), request_data)
         action_value = request_data.get("action")
 
         dispatcher: Dict[str, Tuple[Type[BaseModel], Callable[..., BaseModel]]] = {
@@ -359,21 +362,28 @@ def handle_daemon_request(data: bytes) -> bytes:
         entry = dispatcher.get(key)
         if not entry:
             response = ErrorResponse(error=f"Unknown action: {action_value}", version="1.0")
-            return response.json().encode()
-
-        schema_cls, handler_fn = entry
-        req_obj: BaseModel = schema_cls.parse_obj(request_data)
-        resp_obj: BaseModel = handler_fn(req_obj)
-        return resp_obj.json().encode()
+            response_bytes = response.json().encode()
+        else:
+            schema_cls, handler_fn = entry
+            req_obj: BaseModel = schema_cls.parse_obj(request_data)
+            resp_obj: BaseModel = handler_fn(req_obj)
+            response_bytes = resp_obj.json().encode()
     except StateCorruptionError:
         # Let corruption crash the daemon so the charm can block/alert
         raise
     except (ValidationError, json.JSONDecodeError) as e:
         error_response = ErrorResponse(error=str(e), version="1.0")
-        return error_response.json().encode()
+        response_bytes = error_response.json().encode()
     except ValueError as e:
         error_response = ErrorResponse(error=str(e), version="1.0")
-        return error_response.json().encode()
+        response_bytes = error_response.json().encode()
     except Exception as e:
         error_response = ErrorResponse(error=str(e), version="1.0")
-        return error_response.json().encode()
+        response_bytes = error_response.json().encode()
+
+    logging.info("EPA response: %s", response_bytes.decode())
+    list_resp = handle_list_allocations(
+        ListAllocationsRequest(service_name="", action=ActionType.LIST_ALLOCATIONS)
+    )
+    logging.info("EPA allocations: %s", list_resp.json())
+    return response_bytes

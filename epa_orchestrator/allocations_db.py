@@ -132,6 +132,28 @@ class AllocationsDB:
         available_cpus = sorted(list(all_cpus - self._allocated_cpus))
         return available_cpus
 
+    def get_available_cpus_for_service(self, service_name: str, total_cpus: str) -> list[int]:
+        """Get CPUs available for (re-)allocation to a specific service.
+
+        When a service requests allocation, it may already hold cores. Those cores
+        should be in the pool since they will be freed and re-assigned. Excludes
+        only allocations of *other* services.
+
+        Args:
+            service_name: Service requesting allocation
+            total_cpus: Comma-separated list of all available CPU ranges (e.g. isolated)
+
+        Returns:
+            List of CPU numbers the service may be allocated from
+        """
+        self._load_from_store()
+        all_cpus = self._parse_cpu_ranges(total_cpus)
+        this_service_cpus = self._parse_cpu_ranges(
+            self._allocations.get(service_name, "")
+        ) | self._parse_cpu_ranges(self._explicit_allocations.get(service_name, ""))
+        other_allocated = self._allocated_cpus - this_service_cpus
+        return sorted(list(all_cpus - other_allocated))
+
     def can_allocate_cpus(self, requested_count: int, total_cpus: str) -> bool:
         """Check if requested number of CPUs can be allocated.
 

@@ -89,10 +89,14 @@ class TestSocketCommunication:
         return patch("epa_orchestrator.daemon_handler.get_isolated_cpus", return_value="0-7")
 
     def patch_isolated_cpus_error():
-        """Patch get_isolated_cpus to raise a RuntimeError for error scenario tests."""
+        """Patch get_isolated_cpus: raise on first call (allocate_cores), return '' on later calls.
+
+        The daemon logs allocations after each response. Those calls must get ''
+        so the server thread does not crash before returning the error to the client.
+        """
         return patch(
             "epa_orchestrator.daemon_handler.get_isolated_cpus",
-            side_effect=RuntimeError("No Isolated CPUs configured"),
+            side_effect=[RuntimeError("No Isolated CPUs configured"), ""],
         )
 
     @pytest.mark.parametrize(

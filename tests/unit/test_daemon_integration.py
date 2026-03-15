@@ -298,6 +298,24 @@ class TestDaemonIntegration:
         ]
         assert counts.count(7) == 1
 
+    def test_allocate_cores_num_of_cores_zero_after_existing_allocation(self):
+        """allocate_cores(num_of_cores=0) must use full pool when re-allocating."""
+        allocations_db.clear_all_allocations()
+        isolated = "96-127,224-255,352-383,480-511"  # 128 cores
+        with patch("epa_orchestrator.daemon_handler.get_isolated_cpus", return_value=isolated):
+            # Simulate prior NUMA allocation: service already has 112 cores
+            allocations_db.allocate_cores("openstack-hypervisor", "96-127,224-255,352-383,480-495")
+            r = handle_allocate_cores(
+                AllocateCoresRequest(
+                    service_name="openstack-hypervisor",
+                    action=ActionType.ALLOCATE_CORES,
+                    num_of_cores=0,
+                )
+            )
+            assert r.cores_allocated == 112
+            assert r.allocated_cores == "96-127,224-255,352-383,480-495"
+            assert r.shared_cpus == "496-511"
+
     def test_allocate_cores_valid_override_and_second_service(self):
         """Allocate cores, then override; add second service within remaining."""
         allocations_db.clear_all_allocations()
