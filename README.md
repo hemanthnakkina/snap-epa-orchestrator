@@ -13,6 +13,10 @@ This repository contains the source for the EPA Orchestrator snap.
 - **Secure Unix Socket API**: All orchestration actions are performed via a secure, local Unix socket with JSON-based requests and responses.
 - **Basic Allocation Heuristics**: Automatic allocation based on system size (small vs large systems) when no specific core count is requested.
 
+### CPU Allocation by Percentage
+
+Use the `allocate_cores_percent` action to request a percentage (0–100) of isolated cores. The orchestrator computes the core count from the total isolated CPU pool (ceiling-rounded so small percentages yield at least 1 core). Use `percent: 0` or `percent: -1` to deallocate.
+
 ### CPU Allocation Policy: Small vs. Large Systems
 
 When a client requests core allocation with `num_of_cores: 0`, EPA Orchestrator applies a policy based on the total number of CPUs detected:
@@ -106,7 +110,44 @@ Request CPU allocation for a specific service:
 }
 ```
 
-#### 2. Allocate NUMA Cores (`allocate_numa_cores`)
+#### 2. Allocate Cores Percent (`allocate_cores_percent`)
+
+Request CPU allocation as a percentage of isolated cores:
+
+```json
+{
+  "version": "1.0",
+  "service_name": "my-service",
+  "action": "allocate_cores_percent",
+  "percent": 50
+}
+```
+
+- `percent`: Percentage of isolated cores to allocate (1–100). Use `0` or `-1` to deallocate the service's cores.
+
+#### Response Example (Success)
+
+```json
+{
+  "version": "1.0",
+  "service_name": "my-service",
+  "cores_allocated_count": 10,
+  "allocated_cores": "0-9",
+  "total_available_cpus": 20,
+  "remaining_available_cpus": 10
+}
+```
+
+#### Response Example (Error)
+
+```json
+{
+  "version": "1.0",
+  "error": "Insufficient CPUs available. Requested: 3, Available: 0"
+}
+```
+
+#### 3. Allocate NUMA Cores (`allocate_numa_cores`)
 
 Request a specific number of cores from a particular NUMA node:
 
@@ -163,7 +204,7 @@ Request a specific number of cores from a particular NUMA node:
 }
 ```
 
-#### 3. List Allocations (`list_allocations`)
+#### 4. List Allocations (`list_allocations`)
 
 Get all current service allocations:
 
@@ -214,7 +255,7 @@ Get all current service allocations:
 }
 ```
 
-#### 3. Get Memory Info (`get_memory_info`)
+#### 5. Get Memory Info (`get_memory_info`)
 
 Get NUMA hugepage information (with EPA-tracked overlay), keyed by node name with capacity lists:
 
@@ -258,7 +299,7 @@ Get NUMA hugepage information (with EPA-tracked overlay), keyed by node name wit
 }
 ```
 
-#### 4. Allocate Hugepages (`allocate_hugepages`)
+#### 6. Allocate Hugepages (`allocate_hugepages`)
 
 Record hugepage allocation request (tracking-only) for a specific NUMA node and size:
 

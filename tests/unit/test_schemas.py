@@ -4,9 +4,11 @@
 """Concise unit tests for epa_orchestrator.schemas."""
 
 import pytest
+from pydantic import ValidationError
 
 from epa_orchestrator.schemas import (
     ActionType,
+    AllocateCoresPercentRequest,
     AllocateCoresRequest,
     AllocateCoresResponse,
     ListAllocationsRequest,
@@ -36,6 +38,31 @@ class TestSchemas:
         """Test invalid AllocateCoresRequest creation."""
         with pytest.raises(Exception):
             AllocateCoresRequest(service_name="service1", action="invalid_action", num_of_cores=2)
+
+    def test_allocate_cores_percent_request_valid(self):
+        """Test valid AllocateCoresPercentRequest creation."""
+        req = AllocateCoresPercentRequest(
+            service_name="svc1", action=ActionType.ALLOCATE_CORES_PERCENT, percent=50
+        )
+        assert req.service_name == "svc1"
+        assert req.action == ActionType.ALLOCATE_CORES_PERCENT
+        assert req.percent == 50
+
+    def test_allocate_cores_percent_request_deallocate(self):
+        """Test AllocateCoresPercentRequest with percent=-1 for deallocate."""
+        req = AllocateCoresPercentRequest(
+            service_name="svc1", action=ActionType.ALLOCATE_CORES_PERCENT, percent=-1
+        )
+        assert req.percent == -1
+
+    def test_allocate_cores_percent_request_invalid_percent_over_100(self):
+        """Percent > 100 is rejected; API allows 0-100 or -1."""
+        with pytest.raises(ValidationError):
+            AllocateCoresPercentRequest(
+                service_name="svc1",
+                action=ActionType.ALLOCATE_CORES_PERCENT,
+                percent=101,
+            )
 
     def test_list_allocations_request_invalid(self):
         """Test invalid ListAllocationsRequest creation."""

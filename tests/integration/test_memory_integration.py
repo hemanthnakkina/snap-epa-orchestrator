@@ -13,18 +13,52 @@ from unittest.mock import patch
 import pytest
 from pydantic import parse_obj_as
 
+import epa_orchestrator.hugepages_db as hugepages_db
 from epa_orchestrator.daemon_handler import handle_daemon_request
 from epa_orchestrator.schemas import (
     ActionType,
     AllocateHugepagesRequest,
     AllocateHugepagesResponse,
+    ErrorResponse,
     GetMemoryInfoRequest,
     MemoryInfoResponse,
 )
 
 
+def _mk_memory_summary(free: int, total: int = 10, size_kb: int = 2048):
+    """Return get_memory_summary-shaped dict for node0."""
+    return {
+        "numa_hugepages": {
+            "node0": {
+                "capacity": [{"total": total, "free": free, "size": size_kb}],
+                "allocations": {},
+            }
+        }
+    }
+
+
+def _assert_hugepage_capacity(socket_path, node_id, size_kb, expected_total, expected_free):
+    """Validate hugepage capacity for a node/size via GET_MEMORY_INFO."""
+    mem_request = GetMemoryInfoRequest(service_name="probe", action=ActionType.GET_MEMORY_INFO)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.connect(socket_path)
+        client.sendall(json.dumps(mem_request.model_dump()).encode())
+        response_data = client.recv(4096)
+    mem_response = parse_obj_as(MemoryInfoResponse, json.loads(response_data.decode()))
+    node_key = f"node{node_id}"
+    cap = next(c for c in mem_response.numa_hugepages[node_key].capacity if c.size == size_kb)
+    assert cap.total == expected_total
+    assert cap.free == expected_free
+
+
 class TestMemoryIntegration:
     """Integration tests for memory management functionality."""
+
+    @pytest.fixture(autouse=True)
+    def clear_hugepages_db(self):
+        """Clear hugepages DB before each test."""
+        hugepages_db.clear_all_allocations()
+        yield
 
     @pytest.fixture
     def socket_path(self, tmp_path):
@@ -66,8 +100,11 @@ class TestMemoryIntegration:
         if Path(socket_path).exists():
             Path(socket_path).unlink()
 
-    def test_get_memory_info_via_socket(self, memory_socket_daemon, socket_path):
+    @patch("epa_orchestrator.daemon_handler.get_memory_summary")
+    def test_get_memory_info_via_socket(self, mock_summary, memory_socket_daemon, socket_path):
         """Test getting memory information through socket communication."""
+        mock_summary.return_value = _mk_memory_summary(10)
+
         request = GetMemoryInfoRequest(
             service_name="test-service", action=ActionType.GET_MEMORY_INFO
         )
@@ -84,12 +121,8 @@ class TestMemoryIntegration:
     @patch("epa_orchestrator.daemon_handler.get_memory_summary")
     def test_allocate_hugepages_via_socket(self, mock_summary, memory_socket_daemon, socket_path):
         """Test hugepage allocation through socket communication."""
-        # Provide capacity so the allocation passes under capacity checks
-        mock_summary.return_value = {
-            "numa_hugepages": {
-                "node0": {"capacity": [{"total": 10, "free": 10, "size": 2048}], "allocations": {}}
-            }
-        }
+        mock_summary.return_value = _mk_memory_summary(10)
+
         request = AllocateHugepagesRequest(
             service_name="test-service",
             action=ActionType.ALLOCATE_HUGEPAGES,
@@ -110,8 +143,170 @@ class TestMemoryIntegration:
         assert response.node_id == 0
         assert response.size_kb == 2048
 
-    def test_memory_info_response_structure(self, memory_socket_daemon, socket_path):
+    @patch("epa_orchestrator.daemon_handler.get_memory_summary")
+    def test_allocate_hugepages_deallocate_via_socket(
+        self, mock_summary, memory_socket_daemon, socket_path
+    ):
+        """Test hugepage deallocation (-1) through socket communication."""
+        mock_summary.return_value = _mk_memory_summary(10)
+        # Allocate first
+        request = AllocateHugepagesRequest(
+            service_name="service1",
+            action=ActionType.ALLOCATE_HUGEPAGES,
+            hugepages_requested=2,
+            node_id=0,
+            size_kb=2048,
+        )
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(socket_path)
+            client.sendall(json.dumps(request.model_dump()).encode())
+            response_data = client.recv(4096)
+        response = parse_obj_as(AllocateHugepagesResponse, json.loads(response_data.decode()))
+        assert response.allocation_successful is True
+        assert response.hugepages_requested == 2
+
+        # Service1 allocates 4
+        request = AllocateHugepagesRequest(
+            service_name="service1",
+            action=ActionType.ALLOCATE_HUGEPAGES,
+            hugepages_requested=4,
+            node_id=0,
+            size_kb=2048,
+        )
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(socket_path)
+            client.sendall(json.dumps(request.model_dump()).encode())
+            response_data = client.recv(4096)
+        response = parse_obj_as(AllocateHugepagesResponse, json.loads(response_data.decode()))
+        assert response.allocation_successful is True
+        assert response.hugepages_requested == 4
+
+        # Deallocate with -1
+        request = AllocateHugepagesRequest(
+            service_name="service1",
+            action=ActionType.ALLOCATE_HUGEPAGES,
+            hugepages_requested=-1,
+            node_id=0,
+            size_kb=2048,
+        )
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(socket_path)
+            client.sendall(json.dumps(request.model_dump()).encode())
+            response_data = client.recv(4096)
+        response = parse_obj_as(AllocateHugepagesResponse, json.loads(response_data.decode()))
+        assert response.allocation_successful is True
+        assert response.hugepages_requested == -1
+        assert "Removed recorded" in response.message
+
+    @patch("epa_orchestrator.daemon_handler.get_memory_summary")
+    def test_allocate_hugepages_multiple_services_via_socket(
+        self, mock_summary, memory_socket_daemon, socket_path
+    ):
+        """Test multiple services allocating hugepages; third service gets insufficient error."""
+        mock_summary.side_effect = [
+            _mk_memory_summary(10),
+            _mk_memory_summary(7),
+            _mk_memory_summary(7),
+            _mk_memory_summary(3),
+            _mk_memory_summary(3),
+        ]
+        # Service1 allocates 3
+        request = AllocateHugepagesRequest(
+            service_name="service1",
+            action=ActionType.ALLOCATE_HUGEPAGES,
+            hugepages_requested=3,
+            node_id=0,
+            size_kb=2048,
+        )
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(socket_path)
+            client.sendall(json.dumps(request.model_dump()).encode())
+            response_data = client.recv(4096)
+        response = parse_obj_as(AllocateHugepagesResponse, json.loads(response_data.decode()))
+        assert response.allocation_successful is True
+        assert response.hugepages_requested == 3
+        _assert_hugepage_capacity(
+            socket_path, node_id=0, size_kb=2048, expected_total=10, expected_free=7
+        )
+
+        # Service2 allocates 4
+        request = AllocateHugepagesRequest(
+            service_name="service2",
+            action=ActionType.ALLOCATE_HUGEPAGES,
+            hugepages_requested=4,
+            node_id=0,
+            size_kb=2048,
+        )
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(socket_path)
+            client.sendall(json.dumps(request.model_dump()).encode())
+            response_data = client.recv(4096)
+        response = parse_obj_as(AllocateHugepagesResponse, json.loads(response_data.decode()))
+        assert response.allocation_successful is True
+        assert response.hugepages_requested == 4
+        _assert_hugepage_capacity(
+            socket_path, node_id=0, size_kb=2048, expected_total=10, expected_free=3
+        )
+
+        # Service3 requests 5 when only 3 free -> insufficient
+        request = AllocateHugepagesRequest(
+            service_name="service3",
+            action=ActionType.ALLOCATE_HUGEPAGES,
+            hugepages_requested=5,
+            node_id=0,
+            size_kb=2048,
+        )
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(socket_path)
+            client.sendall(json.dumps(request.model_dump()).encode())
+            response_data = client.recv(4096)
+        response = parse_obj_as(ErrorResponse, json.loads(response_data.decode()))
+        assert "only has 3 free hugepages" in response.error
+        assert "requested additional 5" in response.error
+
+        # Deallocate service1
+        request = AllocateHugepagesRequest(
+            service_name="service1",
+            action=ActionType.ALLOCATE_HUGEPAGES,
+            hugepages_requested=-1,
+            node_id=0,
+            size_kb=2048,
+        )
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(socket_path)
+            client.sendall(json.dumps(request.model_dump()).encode())
+            response_data = client.recv(4096)
+        response = parse_obj_as(AllocateHugepagesResponse, json.loads(response_data.decode()))
+        assert response.allocation_successful is True
+        assert response.hugepages_requested == -1
+
+    @patch("epa_orchestrator.daemon_handler.get_memory_summary")
+    def test_allocate_hugepages_insufficient_capacity_via_socket(
+        self, mock_summary, memory_socket_daemon, socket_path
+    ):
+        """Test error when requesting more hugepages than available free."""
+        mock_summary.return_value = _mk_memory_summary(2)
+
+        request = AllocateHugepagesRequest(
+            service_name="service1",
+            action=ActionType.ALLOCATE_HUGEPAGES,
+            hugepages_requested=5,
+            node_id=0,
+            size_kb=2048,
+        )
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(socket_path)
+            client.sendall(json.dumps(request.model_dump()).encode())
+            response_data = client.recv(4096)
+        response = parse_obj_as(ErrorResponse, json.loads(response_data.decode()))
+        assert "only has 2 free hugepages" in response.error
+        assert "requested additional 5" in response.error
+
+    @patch("epa_orchestrator.daemon_handler.get_memory_summary")
+    def test_memory_info_response_structure(self, mock_summary, memory_socket_daemon, socket_path):
         """Test that memory info response has correct structure."""
+        mock_summary.return_value = _mk_memory_summary(10)
+
         request = GetMemoryInfoRequest(
             service_name="test-service", action=ActionType.GET_MEMORY_INFO
         )

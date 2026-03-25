@@ -5,6 +5,7 @@
 
 import json
 import logging
+import math
 from typing import Callable, Dict, List, Optional, Tuple, Type, Union, cast
 
 from pydantic import BaseModel, ValidationError
@@ -19,6 +20,8 @@ from epa_orchestrator.hugepages_db import (
 from epa_orchestrator.memory_manager import get_memory_summary
 from epa_orchestrator.schemas import (
     ActionType,
+    AllocateCoresPercentRequest,
+    AllocateCoresPercentResponse,
     AllocateCoresRequest,
     AllocateCoresResponse,
     AllocateHugepagesRequest,
@@ -38,6 +41,7 @@ from epa_orchestrator.utils import (
     _count_cpus_in_ranges,
     get_cpus_in_numa_node,
     get_numa_node_cpus,
+    parse_cpu_ranges,
     to_ranges,
 )
 
@@ -81,9 +85,6 @@ def _get_hugepages_context(
 
 def handle_allocate_cores(request: AllocateCoresRequest) -> AllocateCoresResponse:
     """Handle allocate cores action (non-NUMA)."""
-    if request.numa_node is not None:
-        raise ValueError("'numa_node' is not allowed for action allocate_cores")
-
     isolated = get_isolated_cpus()
     if not isolated:
         raise ValueError("No CPUs available")
@@ -135,6 +136,38 @@ def handle_allocate_cores(request: AllocateCoresRequest) -> AllocateCoresRespons
         shared_cpus=shared,
         total_available_cpus=updated_stats["total_available_cpus"],
         remaining_available_cpus=updated_stats["remaining_available_cpus"],
+    )
+
+
+def handle_allocate_cores_percent(
+    request: AllocateCoresPercentRequest,
+) -> AllocateCoresPercentResponse:
+    """Allocate a percentage of isolated cores.
+
+    If percent is -1, deallocate the service's cores.
+    If percent is 0, treat as deallocate.
+    Otherwise, allocate the percentage of isolated cores.
+    The computed core count is ceiling-rounded so small positive percentages
+    (e.g. 1% of 8 cores) yield at least 1 core and never fall back to num_of_cores=0.
+    """
+    isolated_count = len(parse_cpu_ranges(get_isolated_cpus()))
+    num_of_cores = (
+        -1 if request.percent in (-1, 0) else math.ceil(isolated_count * request.percent / 100)
+    )
+
+    core_req = AllocateCoresRequest(
+        service_name=request.service_name,
+        action=ActionType.ALLOCATE_CORES,
+        num_of_cores=num_of_cores,
+    )
+    result = handle_allocate_cores(core_req)
+    return AllocateCoresPercentResponse(
+        version=result.version,
+        service_name=result.service_name,
+        cores_allocated_count=result.cores_allocated,
+        allocated_cores=result.allocated_cores,
+        total_available_cpus=result.total_available_cpus,
+        remaining_available_cpus=result.remaining_available_cpus,
     )
 
 
@@ -345,6 +378,10 @@ def handle_daemon_request(data: bytes) -> bytes:
 
         dispatcher: Dict[str, Tuple[Type[BaseModel], Callable[..., BaseModel]]] = {
             ActionType.ALLOCATE_CORES.value: (AllocateCoresRequest, handle_allocate_cores),
+            ActionType.ALLOCATE_CORES_PERCENT.value: (
+                AllocateCoresPercentRequest,
+                handle_allocate_cores_percent,
+            ),
             ActionType.ALLOCATE_NUMA_CORES.value: (
                 AllocateNumaCoresRequest,
                 handle_allocate_numa_cores,
